@@ -3,13 +3,13 @@ package tun
 import (
 	"fmt"
 	"io"
-
-	"github.com/songgao/water"
+	"log"
 )
 
 // Interface represents a TUN virtual network interface
 type Interface struct {
-	device *water.Interface
+	device device
+	name   string
 	mtu    int
 }
 
@@ -22,24 +22,27 @@ type Config struct {
 // New creates a new TUN interface
 func New(cfg Config) (*Interface, error) {
 	if cfg.MTU == 0 {
-		cfg.MTU = 1500
+		cfg.MTU = 1420
 	}
 
 	// Use platform-specific device creation
-	device, err := createDevice(cfg)
+	dev, name, err := createDevice(cfg)
 	if err != nil {
 		return nil, err
 	}
 
+	log.Printf("TUN interface created: %s (MTU: %d)", name, cfg.MTU)
+
 	return &Interface{
-		device: device,
+		device: dev,
+		name:   name,
 		mtu:    cfg.MTU,
 	}, nil
 }
 
 // Name returns the interface name
 func (t *Interface) Name() string {
-	return t.device.Name()
+	return t.name
 }
 
 // Read reads a packet from the TUN interface

@@ -47,6 +47,11 @@ func main() {
 	}
 	log.Printf("Server Public Key: %s", keyPair.PublicKeyToString())
 
+	// Ensure Wintun is available (Windows only, auto-downloads if needed)
+	if err := tun.EnsureWintun(); err != nil {
+		log.Fatalf("Failed to ensure Wintun: %v", err)
+	}
+
 	// Create TUN interface
 	tunDev, err := tun.New(tun.Config{
 		DeviceName: "vpn0",
