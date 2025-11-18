@@ -11,6 +11,7 @@ import (
 type UDPTransport struct {
 	conn       *net.UDPConn
 	remoteAddr *net.UDPAddr
+	isClient   bool // true if this is a client (connected socket)
 	mu         sync.RWMutex
 }
 
@@ -54,6 +55,7 @@ func NewUDPClient(serverAddr string) (*UDPTransport, error) {
 	return &UDPTransport{
 		conn:       conn,
 		remoteAddr: remoteAddr,
+		isClient:   true, // This is a connected UDP socket
 	}, nil
 }
 
@@ -65,17 +67,17 @@ func (t *UDPTransport) Send(packet *Packet, addr *net.UDPAddr) error {
 	}
 
 	var n int
-	if addr != nil {
-		n, err = t.conn.WriteToUDP(data, addr)
-	} else {
-		t.mu.RLock()
-		remoteAddr := t.remoteAddr
-		t.mu.RUnlock()
 
-		if remoteAddr == nil {
-			return fmt.Errorf("no remote address set")
+	// For client (connected socket), use Write instead of WriteToUDP
+	if t.isClient {
+		n, err = t.conn.Write(data)
+	} else {
+		// For server (unconnected socket), use WriteToUDP
+		if addr != nil {
+			n, err = t.conn.WriteToUDP(data, addr)
+		} else {
+			return fmt.Errorf("server requires destination address")
 		}
-		n, err = t.conn.WriteToUDP(data, remoteAddr)
 	}
 
 	if err != nil {
