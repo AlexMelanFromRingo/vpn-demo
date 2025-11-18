@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -204,7 +205,10 @@ func (s *Server) handleTUN() {
 		packet, err := s.tunDev.ReadPacket()
 		if err != nil {
 			// Don't spam logs for normal read timeouts/empty reads
-			if err.Error() != "EOF" && err.Error() != "No more data is available." {
+			errStr := err.Error()
+			if !strings.Contains(errStr, "EOF") &&
+			   !strings.Contains(errStr, "No more data is available") &&
+			   !strings.Contains(errStr, "timeout") {
 				log.Printf("TUN read error: %v", err)
 			}
 			continue
