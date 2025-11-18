@@ -170,7 +170,10 @@ func (c *Client) handleTUN() {
 	for {
 		packet, err := c.tunDev.ReadPacket()
 		if err != nil {
-			log.Printf("TUN read error: %v", err)
+			// Don't spam logs for normal read timeouts/empty reads
+			if err.Error() != "EOF" && err.Error() != "No more data is available." {
+				log.Printf("TUN read error: %v", err)
+			}
 			continue
 		}
 
