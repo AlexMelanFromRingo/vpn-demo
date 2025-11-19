@@ -25,16 +25,19 @@ func SetupInterface(ifname, localIP, remoteIP string, mtu int) error {
 		mask = "255.0.0.0"
 	}
 
-	fmt.Printf("Configuring Windows adapter '%s' with IP %s\n", ifname, localIPClean)
+	// Extract remote IP (gateway) without CIDR suffix
+	remoteIPClean := strings.Split(remoteIP, "/")[0]
 
-	// Set IP address WITHOUT gateway
-	// CRITICAL: Setting gateway makes VPN the default route and breaks internet!
-	// We only want VPN for 10.0.0.0/24 network, not all traffic
+	fmt.Printf("Configuring Windows adapter '%s' with IP %s, gateway %s\n", ifname, localIPClean, remoteIPClean)
+
+	// Set IP address WITH gateway to route all traffic through VPN
+	// This makes VPN the default route, sending all internet traffic through the server
+	// The server must have NAT/forwarding configured to proxy traffic to the internet
 	cmd := exec.Command("netsh", "interface", "ip", "set", "address",
 		fmt.Sprintf("name=%s", ifname), "source=static",
 		fmt.Sprintf("addr=%s", localIPClean),
-		fmt.Sprintf("mask=%s", mask))
-	// NO GATEWAY parameter - this prevents internet disconnection!
+		fmt.Sprintf("mask=%s", mask),
+		fmt.Sprintf("gateway=%s", remoteIPClean))
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -42,6 +45,7 @@ func SetupInterface(ifname, localIP, remoteIP string, mtu int) error {
 	}
 
 	fmt.Printf("✓ IP address configured successfully\n")
+	fmt.Printf("✓ Default gateway set to %s - all traffic will go through VPN!\n", remoteIPClean)
 
 	// Set MTU - this might fail on some Windows versions, which is OK
 	cmd = exec.Command("netsh", "interface", "ipv4", "set", "subinterface",
@@ -60,7 +64,8 @@ func SetupInterface(ifname, localIP, remoteIP string, mtu int) error {
 	// Give Windows time to update adapter status
 	time.Sleep(300 * time.Millisecond)
 
-	fmt.Printf("✓ Windows adapter configured - internet connection preserved!\n")
+	fmt.Printf("✓ Windows adapter configured - all traffic will be routed through VPN!\n")
+	fmt.Printf("  Make sure the VPN server has NAT/forwarding enabled for internet access.\n")
 
 	return nil
 }
