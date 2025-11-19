@@ -25,19 +25,17 @@ func SetupInterface(ifname, localIP, remoteIP string, mtu int) error {
 		mask = "255.0.0.0"
 	}
 
-	// Extract remote IP (gateway) without CIDR suffix
-	remoteIPClean := strings.Split(remoteIP, "/")[0]
+	fmt.Printf("Configuring Windows adapter '%s' with IP %s (split-tunnel mode)\n", ifname, localIPClean)
 
-	fmt.Printf("Configuring Windows adapter '%s' with IP %s, gateway %s\n", ifname, localIPClean, remoteIPClean)
-
-	// Set IP address WITH gateway to route all traffic through VPN
-	// This makes VPN the default route, sending all internet traffic through the server
-	// The server must have NAT/forwarding configured to proxy traffic to the internet
+	// Set IP address WITHOUT gateway - split-tunnel mode
+	// Only VPN network (10.0.0.0/24) will route through VPN
+	// Internet traffic will use the default Windows connection
+	// This mode works in all environments, no NAT required on server
 	cmd := exec.Command("netsh", "interface", "ip", "set", "address",
 		fmt.Sprintf("name=%s", ifname), "source=static",
 		fmt.Sprintf("addr=%s", localIPClean),
-		fmt.Sprintf("mask=%s", mask),
-		fmt.Sprintf("gateway=%s", remoteIPClean))
+		fmt.Sprintf("mask=%s", mask))
+	// NO GATEWAY parameter - split-tunnel mode
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -45,7 +43,7 @@ func SetupInterface(ifname, localIP, remoteIP string, mtu int) error {
 	}
 
 	fmt.Printf("✓ IP address configured successfully\n")
-	fmt.Printf("✓ Default gateway set to %s - all traffic will go through VPN!\n", remoteIPClean)
+	fmt.Printf("✓ Split-tunnel mode: only 10.0.0.0/24 routed through VPN\n")
 
 	// Set MTU - this might fail on some Windows versions, which is OK
 	cmd = exec.Command("netsh", "interface", "ipv4", "set", "subinterface",
@@ -64,8 +62,9 @@ func SetupInterface(ifname, localIP, remoteIP string, mtu int) error {
 	// Give Windows time to update adapter status
 	time.Sleep(300 * time.Millisecond)
 
-	fmt.Printf("✓ Windows adapter configured - all traffic will be routed through VPN!\n")
-	fmt.Printf("  Make sure the VPN server has NAT/forwarding enabled for internet access.\n")
+	fmt.Printf("✓ Windows adapter configured in split-tunnel mode\n")
+	fmt.Printf("  VPN network: 10.0.0.0/24 → VPN server\n")
+	fmt.Printf("  Internet: Direct connection (not through VPN)\n")
 
 	return nil
 }
