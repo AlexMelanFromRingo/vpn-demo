@@ -1,4 +1,4 @@
-// +build windows
+//go:build windows
 
 package tun
 
@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // SetupInterface configures the TUN interface with IP address
@@ -13,7 +14,6 @@ import (
 func SetupInterface(ifname, localIP, remoteIP string, mtu int) error {
 	// Remove /24 or /32 suffix if present
 	localIPClean := strings.Split(localIP, "/")[0]
-	remoteIPClean := strings.Split(remoteIP, "/")[0]
 
 	// Extract subnet mask from CIDR if present
 	mask := "255.255.255.0"
@@ -27,28 +27,21 @@ func SetupInterface(ifname, localIP, remoteIP string, mtu int) error {
 
 	fmt.Printf("Configuring Windows adapter '%s' with IP %s\n", ifname, localIPClean)
 
-	// Set IP address using netsh
-	// On Windows, Wintun adapter name might have spaces or special characters
+	// Set IP address WITHOUT gateway
+	// CRITICAL: Setting gateway makes VPN the default route and breaks internet!
+	// We only want VPN for 10.0.0.0/24 network, not all traffic
 	cmd := exec.Command("netsh", "interface", "ip", "set", "address",
 		fmt.Sprintf("name=%s", ifname), "source=static",
 		fmt.Sprintf("addr=%s", localIPClean),
-		fmt.Sprintf("mask=%s", mask),
-		fmt.Sprintf("gateway=%s", remoteIPClean))
+		fmt.Sprintf("mask=%s", mask))
+	// NO GATEWAY parameter - this prevents internet disconnection!
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		// Try without gateway
-		cmd = exec.Command("netsh", "interface", "ip", "set", "address",
-			fmt.Sprintf("name=%s", ifname), "source=static",
-			fmt.Sprintf("addr=%s", localIPClean),
-			fmt.Sprintf("mask=%s", mask))
-		output, err = cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("failed to set IP address: %w, output: %s", err, output)
-		}
+		return fmt.Errorf("failed to set IP address: %w, output: %s", err, output)
 	}
 
-	fmt.Printf("IP address configured successfully\n")
+	fmt.Printf("✓ IP address configured successfully\n")
 
 	// Set MTU - this might fail on some Windows versions, which is OK
 	cmd = exec.Command("netsh", "interface", "ipv4", "set", "subinterface",
@@ -57,8 +50,17 @@ func SetupInterface(ifname, localIP, remoteIP string, mtu int) error {
 		// MTU setting might fail, just log warning
 		fmt.Printf("Warning: failed to set MTU (this is usually OK): %s\n", output)
 	} else {
-		fmt.Printf("MTU set to %d\n", mtu)
+		fmt.Printf("✓ MTU set to %d\n", mtu)
 	}
+
+	// Enable adapter explicitly
+	cmd = exec.Command("netsh", "interface", "set", "interface", ifname, "admin=enabled")
+	cmd.Run() // Ignore errors - may already be enabled
+
+	// Give Windows time to update adapter status
+	time.Sleep(300 * time.Millisecond)
+
+	fmt.Printf("✓ Windows adapter configured - internet connection preserved!\n")
 
 	return nil
 }
@@ -69,7 +71,10 @@ func AddRoute(destination, ifname string) error {
 	// On Windows, we might need to use interface index instead of name
 	cmd := exec.Command("route", "add", destination, "0.0.0.0", "if", ifname, "metric", "1")
 	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to add route: %w, output: %s", err, output)
+		// Check if route already exists
+		if !strings.Contains(string(output), "already exists") {
+			return fmt.Errorf("failed to add route: %w, output: %s", err, output)
+		}
 	}
 	return nil
 }
