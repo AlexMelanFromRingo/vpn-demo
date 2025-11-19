@@ -13,6 +13,7 @@ import (
 func SetupInterface(ifname, localIP, remoteIP string, mtu int) error {
 	// Remove /24 or /32 suffix if present
 	localIPClean := strings.Split(localIP, "/")[0]
+	remoteIPClean := strings.Split(remoteIP, "/")[0]
 
 	// Extract subnet mask from CIDR if present
 	mask := "255.255.255.0"
@@ -24,21 +25,39 @@ func SetupInterface(ifname, localIP, remoteIP string, mtu int) error {
 		mask = "255.0.0.0"
 	}
 
+	fmt.Printf("Configuring Windows adapter '%s' with IP %s\n", ifname, localIPClean)
+
 	// Set IP address using netsh
-	// Note: interface name on Windows might be different (e.g., "vpn0" or full name)
+	// On Windows, Wintun adapter name might have spaces or special characters
 	cmd := exec.Command("netsh", "interface", "ip", "set", "address",
-		"name="+ifname, "source=static", "addr="+localIPClean,
-		"mask="+mask)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to set IP address: %w, output: %s", err, output)
+		fmt.Sprintf("name=%s", ifname), "source=static",
+		fmt.Sprintf("addr=%s", localIPClean),
+		fmt.Sprintf("mask=%s", mask),
+		fmt.Sprintf("gateway=%s", remoteIPClean))
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Try without gateway
+		cmd = exec.Command("netsh", "interface", "ip", "set", "address",
+			fmt.Sprintf("name=%s", ifname), "source=static",
+			fmt.Sprintf("addr=%s", localIPClean),
+			fmt.Sprintf("mask=%s", mask))
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to set IP address: %w, output: %s", err, output)
+		}
 	}
+
+	fmt.Printf("IP address configured successfully\n")
 
 	// Set MTU - this might fail on some Windows versions, which is OK
 	cmd = exec.Command("netsh", "interface", "ipv4", "set", "subinterface",
-		ifname, "mtu="+fmt.Sprintf("%d", mtu), "store=persistent")
+		ifname, fmt.Sprintf("mtu=%d", mtu), "store=persistent")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		// MTU setting might fail, just log warning
 		fmt.Printf("Warning: failed to set MTU (this is usually OK): %s\n", output)
+	} else {
+		fmt.Printf("MTU set to %d\n", mtu)
 	}
 
 	return nil
