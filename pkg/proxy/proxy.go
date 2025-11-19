@@ -376,6 +376,18 @@ func buildTCPPacket(srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16, 
 		copy(packet[ipHeaderLen+tcpHeaderLen:], payload)
 	}
 
+	// Calculate and set TCP checksum
+	tcpHeader[16] = 0 // Clear checksum field
+	tcpHeader[17] = 0
+	checksum := calculateTCPChecksum(srcIP.To4(), dstIP.To4(), tcpHeader, payload)
+	binary.BigEndian.PutUint16(tcpHeader[16:18], checksum)
+
+	// Calculate and set IP checksum
+	packet[10] = 0 // Clear IP checksum field
+	packet[11] = 0
+	ipChecksum := calculateIPChecksum(packet[:ipHeaderLen])
+	binary.BigEndian.PutUint16(packet[10:12], ipChecksum)
+
 	return packet
 }
 
@@ -405,5 +417,107 @@ func buildUDPPacket(srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16, 
 		copy(packet[ipHeaderLen+udpHeaderLen:], payload)
 	}
 
+	// Calculate and set UDP checksum
+	udpHeader[6] = 0 // Clear checksum field
+	udpHeader[7] = 0
+	checksum := calculateUDPChecksum(srcIP.To4(), dstIP.To4(), udpHeader, payload)
+	binary.BigEndian.PutUint16(udpHeader[6:8], checksum)
+
+	// Calculate and set IP checksum
+	packet[10] = 0 // Clear IP checksum field
+	packet[11] = 0
+	ipChecksum := calculateIPChecksum(packet[:ipHeaderLen])
+	binary.BigEndian.PutUint16(packet[10:12], ipChecksum)
+
 	return packet
+}
+// calculateIPChecksum calculates IP header checksum
+func calculateIPChecksum(header []byte) uint16 {
+	sum := uint32(0)
+	
+	// Sum all 16-bit words
+	for i := 0; i < len(header)-1; i += 2 {
+		sum += uint32(header[i])<<8 | uint32(header[i+1])
+	}
+	
+	// Add carry
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	
+	// Return one's complement
+	return ^uint16(sum)
+}
+
+// calculateTCPChecksum calculates TCP checksum including pseudo-header
+func calculateTCPChecksum(srcIP, dstIP net.IP, tcpHeader, payload []byte) uint16 {
+	// Pseudo-header
+	pseudoHeader := make([]byte, 12)
+	copy(pseudoHeader[0:4], srcIP.To4())
+	copy(pseudoHeader[4:8], dstIP.To4())
+	pseudoHeader[8] = 0 // Reserved
+	pseudoHeader[9] = 6 // Protocol (TCP)
+	binary.BigEndian.PutUint16(pseudoHeader[10:12], uint16(len(tcpHeader)+len(payload)))
+	
+	// Combine pseudo-header + TCP header + payload
+	data := append(pseudoHeader, tcpHeader...)
+	data = append(data, payload...)
+	
+	// Calculate checksum
+	sum := uint32(0)
+	for i := 0; i < len(data)-1; i += 2 {
+		sum += uint32(data[i])<<8 | uint32(data[i+1])
+	}
+	
+	// Handle odd length
+	if len(data)%2 == 1 {
+		sum += uint32(data[len(data)-1]) << 8
+	}
+	
+	// Add carry
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	
+	return ^uint16(sum)
+}
+
+// calculateUDPChecksum calculates UDP checksum including pseudo-header
+func calculateUDPChecksum(srcIP, dstIP net.IP, udpHeader, payload []byte) uint16 {
+	// Pseudo-header
+	pseudoHeader := make([]byte, 12)
+	copy(pseudoHeader[0:4], srcIP.To4())
+	copy(pseudoHeader[4:8], dstIP.To4())
+	pseudoHeader[8] = 0 // Reserved
+	pseudoHeader[9] = 17 // Protocol (UDP)
+	binary.BigEndian.PutUint16(pseudoHeader[10:12], uint16(len(udpHeader)+len(payload)))
+	
+	// Combine pseudo-header + UDP header + payload
+	data := append(pseudoHeader, udpHeader...)
+	data = append(data, payload...)
+	
+	// Calculate checksum
+	sum := uint32(0)
+	for i := 0; i < len(data)-1; i += 2 {
+		sum += uint32(data[i])<<8 | uint32(data[i+1])
+	}
+	
+	// Handle odd length
+	if len(data)%2 == 1 {
+		sum += uint32(data[len(data)-1]) << 8
+	}
+	
+	// Add carry
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	
+	checksum := ^uint16(sum)
+	
+	// UDP checksum of 0 means no checksum
+	if checksum == 0 {
+		checksum = 0xFFFF
+	}
+	
+	return checksum
 }

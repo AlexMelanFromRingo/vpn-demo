@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/crypto"
+	"github.com/AlexMelanFromRingo/vpn-demo/pkg/proxy"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/transport"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/tun"
 )
@@ -60,11 +61,18 @@ type Client struct {
 }
 
 type Server struct {
-	keyPair    *crypto.KeyPair
-	tunDev     *tun.Interface
-	udpTrans   *transport.UDPTransport
-	clients    map[string]*Client
-	clientsMu  sync.RWMutex
+	keyPair       *crypto.KeyPair
+	tunDev        *tun.Interface
+	udpTrans      *transport.UDPTransport
+	clients       map[string]*Client
+	clientsMu     sync.RWMutex
+	proxy         *proxy.UserspaceProxy
+	proxyPackets  chan ProxyPacket
+}
+
+type ProxyPacket struct {
+	clientAddr *net.UDPAddr
+	data       []byte
 }
 
 func main() {
@@ -115,11 +123,20 @@ func main() {
 	defer udpTrans.Close()
 	log.Printf("UDP server listening on %s", *listenAddr)
 
+	// Create proxy packets channel
+	proxyPackets := make(chan ProxyPacket, 100)
+
+	// Create userspace proxy
+	toClientChan := make(chan []byte, 100)
+	userspaceProxy := proxy.NewUserspaceProxy(toClientChan)
+
 	server := &Server{
-		keyPair:  keyPair,
-		tunDev:   tunDev,
-		udpTrans: udpTrans,
-		clients:  make(map[string]*Client),
+		keyPair:      keyPair,
+		tunDev:       tunDev,
+		udpTrans:     udpTrans,
+		clients:      make(map[string]*Client),
+		proxy:        userspaceProxy,
+		proxyPackets: proxyPackets,
 	}
 
 	// Handle graceful shutdown
@@ -130,8 +147,10 @@ func main() {
 	go server.handleUDP()
 	go server.handleTUN()
 	go server.cleanupClients()
+	go server.handleProxyPackets(toClientChan) // New: handle packets from proxy
 
 	log.Println("Server started successfully!")
+	log.Println("Userspace proxy enabled - TCP/UDP will be proxied to internet")
 	<-sigChan
 	log.Println("Shutting down...")
 }
@@ -222,9 +241,18 @@ func (s *Server) handleData(packet *transport.Packet, addr *net.UDPAddr) {
 		return
 	}
 
-	// Write to TUN
-	if err := s.tunDev.WritePacket(plaintext); err != nil {
-		log.Printf("TUN write error: %v", err)
+	// Debug logging
+	packetInfo := parseIPPacket(plaintext)
+	if strings.Contains(packetInfo, "TCP") || strings.Contains(packetInfo, "UDP") {
+		log.Printf("Client → Proxy: %s", packetInfo)
+	}
+
+	// Send to userspace proxy for internet forwarding
+	if err := s.proxy.HandlePacket(plaintext); err != nil {
+		// If proxy fails, try writing directly to TUN (fallback for ICMP, etc.)
+		if err := s.tunDev.WritePacket(plaintext); err != nil {
+			log.Printf("TUN write error: %v", err)
+		}
 	}
 }
 
@@ -301,5 +329,52 @@ func (s *Server) cleanupClients() {
 			}
 		}
 		s.clientsMu.Unlock()
+	}
+}
+// handleProxyPackets receives packets from userspace proxy and sends them to clients
+func (s *Server) handleProxyPackets(toClientChan <-chan []byte) {
+	for packet := range toClientChan {
+		// Debug logging
+		packetInfo := parseIPPacket(packet)
+		if strings.Contains(packetInfo, "TCP") || strings.Contains(packetInfo, "UDP") {
+			log.Printf("Proxy → Client: %s", packetInfo)
+		}
+
+		// Determine which client should receive this packet
+		// by looking at the destination IP in the packet
+		if len(packet) < 20 {
+			continue
+		}
+
+		dstIP := net.IP(packet[16:20])
+		
+		// Find client with this IP
+		s.clientsMu.RLock()
+		var targetClient *Client
+		for _, client := range s.clients {
+			// For now, send to all clients (typically only one)
+			// In future, track IP->Client mapping
+			targetClient = client
+			break
+		}
+		s.clientsMu.RUnlock()
+
+		if targetClient == nil {
+			log.Printf("No client found for proxied packet to %s", dstIP)
+			continue
+		}
+
+		// Encrypt packet
+		encrypted, err := targetClient.cipher.Encrypt(packet)
+		if err != nil {
+			log.Printf("Failed to encrypt proxy packet: %v", err)
+			continue
+		}
+
+		// Send to client
+		dataPacket := transport.NewDataPacket(encrypted)
+		if err := s.udpTrans.Send(dataPacket, targetClient.addr); err != nil {
+			log.Printf("Failed to send proxy packet to client: %v", err)
+		}
 	}
 }
