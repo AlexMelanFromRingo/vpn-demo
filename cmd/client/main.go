@@ -2,7 +2,9 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -13,6 +15,42 @@ import (
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/transport"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/tun"
 )
+
+// Helper function to parse IP packet for debugging
+func parseIPPacket(packet []byte) string {
+	if len(packet) < 20 {
+		return "Invalid IP packet (too short)"
+	}
+
+	version := packet[0] >> 4
+	if version != 4 {
+		return "Not IPv4"
+	}
+
+	protocol := packet[9]
+	srcIP := net.IP(packet[12:16])
+	dstIP := net.IP(packet[16:20])
+
+	var protoName string
+	switch protocol {
+	case 1:
+		protoName = "ICMP"
+		if len(packet) >= 24 {
+			icmpType := packet[20]
+			icmpCode := packet[21]
+			return fmt.Sprintf("ICMP type=%d code=%d from %s to %s", icmpType, icmpCode, srcIP, dstIP)
+		}
+		return fmt.Sprintf("ICMP from %s to %s", srcIP, dstIP)
+	case 6:
+		protoName = "TCP"
+	case 17:
+		protoName = "UDP"
+	default:
+		protoName = fmt.Sprintf("Protocol-%d", protocol)
+	}
+
+	return fmt.Sprintf("%s from %s to %s", protoName, srcIP, dstIP)
+}
 
 type Client struct {
 	keyPair    *crypto.KeyPair
@@ -159,9 +197,17 @@ func (c *Client) handleUDP() {
 				continue
 			}
 
+			// Debug: Log packet info (especially ICMP)
+			packetInfo := parseIPPacket(plaintext)
+			if strings.Contains(packetInfo, "ICMP") {
+				log.Printf("Server → TUN: %s (len=%d)", packetInfo, len(plaintext))
+			}
+
 			// Write to TUN
 			if err := c.tunDev.WritePacket(plaintext); err != nil {
 				log.Printf("TUN write error: %v", err)
+			} else if strings.Contains(packetInfo, "ICMP") {
+				log.Printf("✓ Wrote ICMP packet to TUN interface")
 			}
 		}
 	}
@@ -185,6 +231,12 @@ func (c *Client) handleTUN() {
 			continue
 		}
 
+		// Debug: Log packet info (especially ICMP)
+		packetInfo := parseIPPacket(packet)
+		if strings.Contains(packetInfo, "ICMP") {
+			log.Printf("TUN → Server: %s (len=%d)", packetInfo, len(packet))
+		}
+
 		// Encrypt packet
 		encrypted, err := c.cipher.Encrypt(packet)
 		if err != nil {
@@ -196,6 +248,8 @@ func (c *Client) handleTUN() {
 		dataPacket := transport.NewDataPacket(encrypted)
 		if err := c.udpTrans.Send(dataPacket, nil); err != nil {
 			log.Printf("Failed to send: %v", err)
+		} else if strings.Contains(packetInfo, "ICMP") {
+			log.Printf("✓ Sent ICMP packet to server")
 		}
 	}
 }

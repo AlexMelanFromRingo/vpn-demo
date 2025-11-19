@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -15,6 +16,42 @@ import (
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/transport"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/tun"
 )
+
+// Helper function to parse IP packet for debugging
+func parseIPPacket(packet []byte) string {
+	if len(packet) < 20 {
+		return "Invalid IP packet (too short)"
+	}
+
+	version := packet[0] >> 4
+	if version != 4 {
+		return "Not IPv4"
+	}
+
+	protocol := packet[9]
+	srcIP := net.IP(packet[12:16])
+	dstIP := net.IP(packet[16:20])
+
+	var protoName string
+	switch protocol {
+	case 1:
+		protoName = "ICMP"
+		if len(packet) >= 24 {
+			icmpType := packet[20]
+			icmpCode := packet[21]
+			return fmt.Sprintf("ICMP type=%d code=%d from %s to %s", icmpType, icmpCode, srcIP, dstIP)
+		}
+		return fmt.Sprintf("ICMP from %s to %s", srcIP, dstIP)
+	case 6:
+		protoName = "TCP"
+	case 17:
+		protoName = "UDP"
+	default:
+		protoName = fmt.Sprintf("Protocol-%d", protocol)
+	}
+
+	return fmt.Sprintf("%s from %s to %s", protoName, srcIP, dstIP)
+}
 
 type Client struct {
 	addr   *net.UDPAddr
@@ -214,6 +251,12 @@ func (s *Server) handleTUN() {
 			continue
 		}
 
+		// Debug: Log packet info (especially ICMP)
+		packetInfo := parseIPPacket(packet)
+		if strings.Contains(packetInfo, "ICMP") {
+			log.Printf("TUN → Client: %s (len=%d)", packetInfo, len(packet))
+		}
+
 		// Send to all active clients
 		s.clientsMu.RLock()
 		clients := make([]*Client, 0, len(s.clients))
@@ -221,6 +264,10 @@ func (s *Server) handleTUN() {
 			clients = append(clients, client)
 		}
 		s.clientsMu.RUnlock()
+
+		if len(clients) == 0 && strings.Contains(packetInfo, "ICMP") {
+			log.Printf("WARNING: ICMP packet received but no active clients!")
+		}
 
 		for _, client := range clients {
 			// Encrypt packet
@@ -234,6 +281,8 @@ func (s *Server) handleTUN() {
 			dataPacket := transport.NewDataPacket(encrypted)
 			if err := s.udpTrans.Send(dataPacket, client.addr); err != nil {
 				log.Printf("Failed to send to %s: %v", client.addr, err)
+			} else if strings.Contains(packetInfo, "ICMP") {
+				log.Printf("✓ Sent ICMP packet to client %s", client.addr)
 			}
 		}
 	}
