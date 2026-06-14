@@ -17,7 +17,7 @@ Lightweight VPN - это современный VPN с упором на без�
 │  TUN (L3)   │                               │  TUN (L3)   │
 │      ↕      │                               │      ↕      │
 │  VPN Tunnel │←────── Encrypted UDP ────────→│  VPN Tunnel │
-│      ↕      │         AES-256-GCM           │      ↕      │
+│      ↕      │    Noise + ChaCha20-Poly1305  │      ↕      │
 │ UDP Socket  │                               │ UDP Socket  │
 │      ↕      │                               │      ↕      │
 │  Ethernet   │                               │  Ethernet   │
@@ -57,65 +57,46 @@ TUN device: kernel → userspace (наше приложение)
 VPN читает пакет через tunDev.ReadPacket()
 ```
 
-### 2. Crypto Layer (`pkg/crypto/`)
+### 2. Session Layer (`pkg/session/`)
 
-#### 2.1 Key Exchange (`keypair.go`)
+#### 2.1 Handshake — Noise Protocol (`session.go`)
 
-**Алгоритм:** Curve25519 ECDH (Elliptic Curve Diffie-Hellman)
+**Паттерн:** `Noise_IK_25519_ChaChaPoly_BLAKE2s` (примитивы как у WireGuard),
+реализация — библиотека `github.com/flynn/noise` (собственной криптографии нет).
 
-**Процесс:**
-1. Клиент генерирует пару ключей: `(PrivKey_C, PubKey_C)`
-2. Сервер генерирует пару ключей: `(PrivKey_S, PubKey_S)`
-3. Обмениваются публичными ключами
-4. Вычисляют общий секрет:
-   - Клиент: `SharedSecret = ECDH(PrivKey_C, PubKey_S)`
-   - Сервер: `SharedSecret = ECDH(PrivKey_S, PubKey_C)`
+**Идентичности:** у каждой стороны долговременная статическая Curve25519-пара.
+Приватный ключ — в файле (`-key-file`), генерируется `cmd/keygen`.
 
-**Результат:** Обе стороны имеют идентичный 32-байтовый `SharedSecret`
+**Процесс (Noise_IK, 2 сообщения):**
+1. Клиент (initiator) **заранее знает и пинит** статический публичный ключ
+   сервера (`-server-key`).
+2. msg1 (`-> e, es, s, ss`): клиент шифрует свою статическую идентичность для
+   сервера. Сервер расшифровывает только своим приватным ключом → MITM невозможен.
+3. Сервер узнаёт статический ключ клиента и сверяет его с **allowlist** (`-peers`).
+4. msg2 (`<- e, ee, se`): обе стороны выводят два симметричных ключа (Split) с
+   **Perfect Forward Secrecy** (эфемерные ключи уникальны на сессию).
 
-#### 2.2 Encryption (`cipher.go`)
+#### 2.2 Transport Encryption (`session.go`)
 
-**Алгоритм:** AES-256-GCM (Galois/Counter Mode)
+**Алгоритм:** ChaCha20-Poly1305 (AEAD), отдельный ключ на каждое направление
+(Noise CipherState).
 
-**Почему GCM?**
-- Аутентифицированное шифрование (AEAD - Authenticated Encryption with Associated Data)
-- Защита от подделки (authentication tag)
-- Высокая производительность (аппаратное ускорение AES-NI)
-- Параллелизуемое шифрование
-
-**Session Keys (Ротация ключей):**
-
-```go
-epoch = UnixTimestamp / 300  // Новый epoch каждые 5 минут
-sessionKey = SHA256(sharedSecret || epoch)
+**Формат кадра:**
+```
+┌──────────────┬─────────────┬──────────────┐
+│ Counter (8)  │ Ciphertext  │ Auth Tag(16) │
+└──────────────┴─────────────┴──────────────┘
 ```
 
-**Почему ротация?**
-- Perfect Forward Secrecy: компрометация одного ключа не открывает старый трафик
-- Ограничение количества данных на один ключ (best practice для GCM)
+- **Counter**: монотонный 64-битный счётчик; задаётся как nonce шифра
+  (`SetNonce`), гарантируя уникальность nonce в сессии, и служит входом для
+  sliding-window анти-replay фильтра (RFC 6479, окно 1024) на приёме.
+- Counter обновляет окно только **после** успешной AEAD-аутентификации — поэтому
+  подделанный счётчик не может сдвинуть окно.
 
-**Формат зашифрованных данных:**
-```
-┌───────────┬──────────┬─────────────┬──────────────┐
-│ Epoch (8) │ Seq (8)  │ Ciphertext  │ Auth Tag(16) │
-└───────────┴──────────┴─────────────┴──────────────┘
-```
-
-- **Epoch**: Временная метка для определения ключа (`SHA256(secret‖epoch)`)
-- **Seq**: Монотонный sequence number. Служит детерминированным GCM-nonce
-  (гарантирует уникальность nonce под одним ключом, без birthday-bound) и входом
-  для sliding-window анти-replay фильтра на приёме
-- **Ciphertext**: Зашифрованные данные
-- **Auth Tag**: GMAC тег для проверки подлинности
-
-**Аутентифицированный handshake (PSK):**
-```
-┌────────────┬───────────────┬──────────────────────────────────┐
-│ PubKey(32) │ Timestamp (8) │ HMAC-SHA256(psk, pubkey‖ts) (32)  │
-└────────────┴───────────────┴──────────────────────────────────┘
-```
-Проверяется constant-time сравнением; timestamp с допуском ±60 c ограничивает
-replay handshake. Привязка pubkey к MAC закрывает MITM-подмену ключа.
+Это в точности подход WireGuard: Noise для аутентификации/ключей, а поверх UDP —
+собственное обрамление с явным счётчиком и анти-replay (т.к. UDP переупорядочивает
+и теряет пакеты, прямые transport-сообщения Noise неприменимы).
 
 ### 3. Transport Layer (`pkg/transport/`)
 
@@ -331,83 +312,64 @@ Client                           Server
 
 | Угроза | Защита |
 |--------|--------|
-| Man-in-the-Middle | ECDH + PSK-аутентификация handshake (HMAC привязан к pubkey) |
-| Unauthorized clients | PSK обязателен при заданном `-psk`/`VPN_PSK` |
-| Eavesdropping | AES-256-GCM encryption |
-| Packet tampering | GCM authentication tag |
-| Replay attacks | Sequence number + sliding window (RFC 6479) + детерм. nonce |
-| Handshake replay | Timestamp с допуском ±60 c |
+| Man-in-the-Middle | Noise_IK + пиннинг статического ключа сервера (`-server-key`) |
+| Unauthorized clients | Allowlist статических ключей клиентов (`-peers`) |
+| Eavesdropping | ChaCha20-Poly1305 (AEAD) |
+| Packet tampering | Poly1305 authentication tag |
+| Replay attacks | Counter + sliding window (RFC 6479) |
 | Traffic analysis | Random padding, random prefix |
 | DPI detection | Obfuscation layer |
-| Key compromise | Key rotation every 5 min (PFS) |
-| DoS (handshake flood) | Token-bucket rate limiting; PSK-проверка до ECDH |
+| Key compromise | Perfect Forward Secrecy (эфемерные ключи на сессию) |
+| DoS (handshake flood) | Per-source-IP rate limiting + глобальный backstop |
 
 ### Текущие ограничения
 
-⚠️ **Это учебная реализация.** Реализовано: PSK-аутентификация, анти-replay,
-rate limiting. Остаётся для production:
+⚠️ **Это учебная реализация.** Реализовано: Noise-аутентификация по ключам,
+анти-replay, per-IP rate limiting. Остаётся для production:
 
-1. **PSK вместо сертификатов/Noise** — один общий ключ на всех клиентов
-2. **Глобальный** rate limit, без учёта source-IP
-3. **No cert validation** — доверие к серверу строится на знании PSK
+1. **Нет периодического rehandshake** — одна сессия на подключение
+2. **Allowlist ключей вручную** — без CA/сертификатов
+3. **Глобальный TUN/маршрутизация** — NAT настраивается отдельным скриптом
 
-### Улучшения для production
+### Уже реализовано (бывшие TODO)
 
-```go
-// TODO: Pre-shared key для аутентификации
-type Handshake struct {
-    PublicKey [32]byte
-    Signature [64]byte  // Ed25519 signature with PSK
-    Timestamp int64
-}
+- ✅ Аутентификация — Noise_IK с пиннингом ключа сервера и allowlist клиентов
+  (`pkg/session`). PSK больше не нужен.
+- ✅ Replay protection — явный counter + sliding window (`pkg/session/replay.go`).
+- ✅ Rate limiting — per-source-IP + глобальный backstop (`pkg/ratelimit`).
 
-// TODO: Sequence numbers для replay protection
-type DataPacket struct {
-    SequenceNumber uint64
-    EncryptedData  []byte
-}
-
-// TODO: Rate limiting
-rateLimiter := rate.NewLimiter(rate.Limit(100), 1000)
-```
+### Что ещё можно добавить
+- Периодический rehandshake (rekey) для долгоживущих сессий, как в WireGuard.
+- CA/сертификаты вместо ручного allowlist публичных ключей.
 
 ## Производительность
 
 ### Бенчмарки (примерные на современном CPU)
 
 ```
-Операция                    Время
+Операция                       Время
 ────────────────────────────────────
-ECDH key exchange           ~50 μs
-AES-256-GCM encrypt (1KB)   ~2 μs
-AES-256-GCM decrypt (1KB)   ~2 μs
-TUN read/write              ~10 μs
-UDP send/receive            ~20 μs
+Noise handshake (на сессию)    ~100 μs
+ChaCha20-Poly1305 (1KB)        ~1-2 μs
+TUN read/write                 ~10 μs
+UDP send/receive               ~20 μs
 ────────────────────────────────────
-Total overhead per packet   ~35 μs
-```
-
-### Throughput
-
-```
-CPU: Modern x86_64 with AES-NI
-Throughput: 500-800 Mbps
-Latency overhead: 1-2 ms
+Overhead на пакет данных       ~35 μs
 ```
 
 ### Оптимизации
 
-1. **AES-NI**: Аппаратное ускорение AES на x86
+1. **ChaCha20-Poly1305**: быстрый AEAD без зависимости от AES-NI
 2. **Большие буферы**: 4MB для UDP socket
-3. **Zero-copy**: Минимум аллокаций
+3. **Кэш ключей**: один handshake на подключение, потоковый AEAD на data-path
 4. **Goroutines**: Параллельная обработка
 
 ## Сравнение с другими VPN
 
 | Feature | Our VPN | WireGuard | OpenVPN |
 |---------|---------|-----------|---------|
-| Key Exchange | ECDH | Noise Protocol | RSA/ECDH |
-| Encryption | AES-256-GCM | ChaCha20-Poly1305 | AES-256-GCM/CBC |
+| Key Exchange | Noise_IK | Noise Protocol | RSA/ECDH |
+| Encryption | ChaCha20-Poly1305 | ChaCha20-Poly1305 | AES-256-GCM/CBC |
 | Transport | UDP | UDP | UDP/TCP |
 | Lines of Code | ~1000 | ~4000 | ~100,000 |
 | Performance | Good | Excellent | Moderate |

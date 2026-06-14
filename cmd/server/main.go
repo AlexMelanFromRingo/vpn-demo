@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"errors"
 	"flag"
 	"io"
@@ -13,28 +14,32 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/AlexMelanFromRingo/vpn-demo/pkg/crypto"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/ipparse"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/ratelimit"
+	"github.com/AlexMelanFromRingo/vpn-demo/pkg/session"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/transport"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/tun"
 )
 
 type Client struct {
 	addr     *net.UDPAddr
-	cipher   *crypto.SessionCipher
+	session  *session.Session
 	lastSeen time.Time
 }
 
 type Server struct {
-	keyPair   *crypto.KeyPair
-	psk       []byte
+	identity  *session.Identity
+	allowlist map[string]bool // base64 public keys authorised to connect
+	allowAny  bool            // true when no allowlist is configured
 	tunDev    *tun.Interface
 	udpTrans  *transport.UDPTransport
 	clients   map[string]*Client
 	clientsMu sync.RWMutex
 
-	handshakeLimiter *ratelimit.TokenBucket
+	// Handshake DoS protection: a global cap plus an independent per-source-IP
+	// limiter so one source cannot starve the others.
+	handshakeGlobal *ratelimit.TokenBucket
+	handshakePerIP  *ratelimit.IPLimiter
 }
 
 func main() {
@@ -42,26 +47,37 @@ func main() {
 	tunIP := flag.String("tun-ip", "10.0.0.1/24", "TUN interface IP")
 	peerIP := flag.String("peer-ip", "10.0.0.2", "Peer IP for TUN")
 	mtu := flag.Int("mtu", 1420, "MTU size")
-	pskFlag := flag.String("psk", "", "pre-shared key for client authentication (or set VPN_PSK env)")
+	keyFile := flag.String("key-file", "server.key", "path to the server's static identity key (created if missing)")
+	peers := flag.String("peers", "", "comma-separated base64 client public keys allowed to connect")
+	peersFile := flag.String("peers-file", "", "file with one base64 client public key per line")
 	flag.Parse()
-
-	psk := resolvePSK(*pskFlag)
 
 	log.Println("=== Lightweight VPN Server ===")
 	log.Printf("Listen: %s", *listenAddr)
 	log.Printf("TUN IP: %s", *tunIP)
-	if len(psk) == 0 {
-		log.Println("WARNING: no PSK set (-psk / VPN_PSK) — client authentication is DISABLED")
-	} else {
-		log.Println("Client authentication: ENABLED (PSK)")
-	}
 
-	// Generate server key pair
-	keyPair, err := crypto.GenerateKeyPair()
+	// Load (or create) the server's long-term static identity. Its public key is
+	// the trust anchor clients must pin via -server-key.
+	identity, created, err := session.LoadOrCreateIdentityFile(*keyFile)
 	if err != nil {
-		log.Fatalf("Failed to generate key pair: %v", err)
+		log.Fatalf("Failed to load identity: %v", err)
 	}
-	log.Printf("Server Public Key: %s", keyPair.PublicKeyToString())
+	if created {
+		log.Printf("Generated new server identity, saved to %s", *keyFile)
+	}
+	log.Printf("Server static public key: %s", identity.PublicKeyBase64())
+	log.Printf("  -> clients connect with: -server-key %s", identity.PublicKeyBase64())
+
+	allowlist, err := buildAllowlist(*peers, *peersFile)
+	if err != nil {
+		log.Fatalf("Failed to parse peers: %v", err)
+	}
+	allowAny := len(allowlist) == 0
+	if allowAny {
+		log.Println("WARNING: no -peers/-peers-file allowlist set — any cryptographically valid client is accepted")
+	} else {
+		log.Printf("Client authorisation: ENABLED (%d allowed peer key(s))", len(allowlist))
+	}
 
 	// Ensure Wintun is available (Windows only, auto-downloads if needed)
 	if err := tun.EnsureWintun(); err != nil {
@@ -94,14 +110,16 @@ func main() {
 	log.Printf("UDP server listening on %s", *listenAddr)
 
 	server := &Server{
-		keyPair:  keyPair,
-		psk:      psk,
-		tunDev:   tunDev,
-		udpTrans: udpTrans,
-		clients:  make(map[string]*Client),
-		// Bound handshake processing to mitigate DoS from unauthenticated floods:
-		// ~25 handshakes/sec sustained, bursts up to 50.
-		handshakeLimiter: ratelimit.NewTokenBucket(25, 50),
+		identity:  identity,
+		allowlist: allowlist,
+		allowAny:  allowAny,
+		tunDev:    tunDev,
+		udpTrans:  udpTrans,
+		clients:   make(map[string]*Client),
+		// Global backstop: ~100 handshakes/sec, burst 200.
+		handshakeGlobal: ratelimit.NewTokenBucket(100, 200),
+		// Per-source-IP: ~5 handshakes/sec, burst 10, tracking up to 4096 IPs.
+		handshakePerIP: ratelimit.NewIPLimiter(5, 10, 4096),
 	}
 
 	// Handle graceful shutdown
@@ -144,34 +162,41 @@ func (s *Server) handleUDP() {
 }
 
 func (s *Server) handleHandshake(packet *transport.Packet, addr *net.UDPAddr) {
-	// Rate-limit handshake processing to bound CPU under floods.
-	if !s.handshakeLimiter.Allow() {
-		log.Printf("Handshake from %s dropped (rate limited)", addr)
+	// DoS protection: global cap, then a per-source-IP bucket.
+	if !s.handshakeGlobal.Allow() {
+		log.Printf("Handshake from %s dropped (global rate limit)", addr)
+		return
+	}
+	if !s.handshakePerIP.Allow(addr.IP.String()) {
+		log.Printf("Handshake from %s dropped (per-IP rate limit)", addr)
 		return
 	}
 
 	log.Printf("Handshake from %s", addr)
 
-	// Authenticate the handshake with the PSK and recover the client's public
-	// key. This is a cheap HMAC check done BEFORE the (more expensive) ECDH, so
-	// unauthenticated peers are rejected without doing scalar multiplication.
-	clientPubKey, err := crypto.OpenHandshake(s.psk, packet.Payload, time.Now().Unix(), crypto.DefaultHandshakeSkewSec)
+	// Run the Noise_IK responder. ReadMsg1 authenticates the handshake against
+	// our static key and recovers the client's static public key.
+	resp, err := session.NewResponder(s.identity)
+	if err != nil {
+		log.Printf("Failed to start responder: %v", err)
+		return
+	}
+	clientStatic, err := resp.ReadMsg1(packet.Payload)
 	if err != nil {
 		log.Printf("Rejected handshake from %s: %v", addr, err)
 		return
 	}
 
-	// Compute shared secret
-	sharedSecret, err := s.keyPair.ComputeSharedSecret(clientPubKey)
-	if err != nil {
-		log.Printf("Failed to compute shared secret: %v", err)
+	// Authorisation: is this client's identity allowed?
+	clientKeyB64 := base64.StdEncoding.EncodeToString(clientStatic)
+	if !s.allowAny && !s.allowlist[clientKeyB64] {
+		log.Printf("Rejected handshake from %s: unauthorised client key %s", addr, clientKeyB64)
 		return
 	}
 
-	// Create cipher
-	cipher, err := crypto.NewSessionCipher(sharedSecret)
+	msg2, sess, err := resp.WriteMsg2()
 	if err != nil {
-		log.Printf("Failed to create cipher: %v", err)
+		log.Printf("Failed to complete handshake with %s: %v", addr, err)
 		return
 	}
 
@@ -180,30 +205,18 @@ func (s *Server) handleHandshake(packet *transport.Packet, addr *net.UDPAddr) {
 	s.clientsMu.Lock()
 	s.clients[clientKey] = &Client{
 		addr:     addr,
-		cipher:   cipher,
+		session:  sess,
 		lastSeen: time.Now(),
 	}
 	s.clientsMu.Unlock()
 
-	log.Printf("Client registered: %s (epoch: %d)", addr, cipher.GetCurrentEpoch())
+	log.Printf("Client registered: %s (key %s)", addr, clientKeyB64)
 
-	// Send our authenticated public key back.
-	response := transport.NewHandshakePacket(crypto.BuildHandshake(s.psk, s.keyPair.PublicKey, time.Now().Unix()))
+	// Send the Noise response message.
+	response := transport.NewHandshakePacket(msg2)
 	if err := s.udpTrans.Send(response, addr); err != nil {
 		log.Printf("Failed to send handshake response: %v", err)
 	}
-}
-
-// resolvePSK returns the pre-shared key from the flag, falling back to the
-// VPN_PSK environment variable so secrets need not appear on the command line.
-func resolvePSK(flagVal string) []byte {
-	if flagVal != "" {
-		return []byte(flagVal)
-	}
-	if env := os.Getenv("VPN_PSK"); env != "" {
-		return []byte(env)
-	}
-	return nil
 }
 
 func (s *Server) handleData(packet *transport.Packet, addr *net.UDPAddr) {
@@ -218,17 +231,18 @@ func (s *Server) handleData(packet *transport.Packet, addr *net.UDPAddr) {
 		return
 	}
 
-	// Update last seen
-	s.clientsMu.Lock()
-	client.lastSeen = time.Now()
-	s.clientsMu.Unlock()
-
-	// Decrypt packet
-	plaintext, err := client.cipher.Decrypt(packet.Payload)
+	// Decrypt packet (also enforces the anti-replay window).
+	plaintext, err := client.session.Decrypt(packet.Payload)
 	if err != nil {
 		log.Printf("Decryption failed from %s: %v", addr, err)
 		return
 	}
+
+	// Update last seen only after a packet authenticates, so spoofed/garbage
+	// traffic cannot keep a dead client alive.
+	s.clientsMu.Lock()
+	client.lastSeen = time.Now()
+	s.clientsMu.Unlock()
 
 	// Write to TUN
 	if err := s.tunDev.WritePacket(plaintext); err != nil {
@@ -284,7 +298,7 @@ func (s *Server) handleTUN() {
 
 		for _, client := range clients {
 			// Encrypt packet
-			encrypted, err := client.cipher.Encrypt(packet)
+			encrypted, err := client.session.Encrypt(packet)
 			if err != nil {
 				log.Printf("Encryption failed: %v", err)
 				continue
@@ -315,4 +329,44 @@ func (s *Server) cleanupClients() {
 		}
 		s.clientsMu.Unlock()
 	}
+}
+
+// buildAllowlist parses authorised client public keys from a comma-separated
+// flag and/or a file (one base64 key per line, '#' comments allowed). Keys are
+// normalised to canonical base64 so lookups are exact.
+func buildAllowlist(peers, peersFile string) (map[string]bool, error) {
+	set := make(map[string]bool)
+
+	add := func(raw string) error {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || strings.HasPrefix(raw, "#") {
+			return nil
+		}
+		key, err := session.ParsePublicKey(raw)
+		if err != nil {
+			return err
+		}
+		set[base64.StdEncoding.EncodeToString(key)] = true
+		return nil
+	}
+
+	for _, p := range strings.Split(peers, ",") {
+		if err := add(p); err != nil {
+			return nil, err
+		}
+	}
+
+	if peersFile != "" {
+		data, err := os.ReadFile(peersFile)
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if err := add(line); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return set, nil
 }

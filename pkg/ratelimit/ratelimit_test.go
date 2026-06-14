@@ -42,6 +42,66 @@ func TestTokenBucketRefill(t *testing.T) {
 	}
 }
 
+func TestIPLimiterIsolatesSources(t *testing.T) {
+	l := NewIPLimiter(1, 3, 100)
+	frozen := time.Now()
+	l.now = func() time.Time { return frozen }
+
+	// IP "A" burns its whole burst...
+	aAllowed := 0
+	for i := 0; i < 10; i++ {
+		if l.Allow("A") {
+			aAllowed++
+		}
+	}
+	if aAllowed != 3 {
+		t.Fatalf("A allowed %d, want 3", aAllowed)
+	}
+	// ...but a different source "B" is unaffected.
+	if !l.Allow("B") {
+		t.Fatal("B should be allowed despite A being throttled")
+	}
+}
+
+func TestIPLimiterEvictsWhenFull(t *testing.T) {
+	l := NewIPLimiter(1, 1, 2) // track at most 2 sources
+	frozen := time.Now()
+	l.now = func() time.Time { return frozen }
+
+	l.Allow("A")
+	frozen = frozen.Add(time.Millisecond)
+	l.Allow("B")
+	frozen = frozen.Add(time.Millisecond)
+	l.Allow("C") // should evict the oldest (A)
+
+	l.mu.Lock()
+	n := len(l.buckets)
+	_, hasA := l.buckets["A"]
+	l.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("tracked %d sources, want 2", n)
+	}
+	if hasA {
+		t.Fatal("oldest source A should have been evicted")
+	}
+}
+
+func TestIPLimiterConcurrent(t *testing.T) {
+	l := NewIPLimiter(1000, 100, 1000)
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := string(rune('A' + i%5))
+			for j := 0; j < 100; j++ {
+				l.Allow(key)
+			}
+		}(i)
+	}
+	wg.Wait() // -race + no panic
+}
+
 func TestTokenBucketConcurrent(t *testing.T) {
 	b := NewTokenBucket(1000, 100)
 	var wg sync.WaitGroup

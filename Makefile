@@ -1,4 +1,4 @@
-.PHONY: all build server client windows-client clean deps test test-race vet integration-test
+.PHONY: all build server client keygen windows-client clean deps test test-race vet integration-test
 
 all: build
 
@@ -6,7 +6,7 @@ deps:
 	go mod download
 	go mod tidy
 
-build: server client
+build: server client keygen
 
 server:
 	@echo "Building server for Linux..."
@@ -16,13 +16,18 @@ client:
 	@echo "Building client for Linux..."
 	go build -o bin/vpn-client ./cmd/client
 
+keygen:
+	@echo "Building keygen for Linux..."
+	go build -o bin/keygen ./cmd/keygen
+
 windows-client:
 	@echo "Building client for Windows..."
 	GOOS=windows GOARCH=amd64 go build -o bin/vpn-client.exe ./cmd/client
 
-all-platforms: server client windows-client
-	@echo "Building server for Windows..."
+all-platforms: server client keygen windows-client
+	@echo "Building server + keygen for Windows..."
 	GOOS=windows GOARCH=amd64 go build -o bin/vpn-server.exe ./cmd/server
+	GOOS=windows GOARCH=amd64 go build -o bin/keygen.exe ./cmd/keygen
 
 clean:
 	rm -rf bin/

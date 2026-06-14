@@ -20,9 +20,8 @@ UNDERLAY_C="10.50.0.2"
 PORT="51820"
 TUN_S="10.0.0.1"
 TUN_C="10.0.0.2"
-PSK="s3cr3t-integration-key"
 
-# Second underlay for the negative (wrong-PSK) authentication test.
+# Second underlay for the negative authentication tests.
 NS_BAD="vpn_test_bad"
 VETH_S2="vpn_t_s2"
 VETH_B="vpn_t_b"
@@ -32,6 +31,7 @@ UNDERLAY_B="10.51.0.2"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRV_BIN="${ROOT_DIR}/bin/vpn-server"
 CLI_BIN="${ROOT_DIR}/bin/vpn-client"
+KEYGEN_BIN="${ROOT_DIR}/bin/keygen"
 LOG_DIR="$(mktemp -d /tmp/vpn-itest.XXXXXX)"
 
 PASS=0
@@ -66,8 +66,25 @@ GO_BIN="$(command -v go || true)"
 [[ -z "$GO_BIN" && -x /usr/local/go/bin/go ]] && GO_BIN=/usr/local/go/bin/go
 [[ -z "$GO_BIN" ]] && { echo "go toolchain not found"; exit 1; }
 log "building binaries with $GO_BIN ..."
-( cd "$ROOT_DIR" && "$GO_BIN" build -o "$SRV_BIN" ./cmd/server && "$GO_BIN" build -o "$CLI_BIN" ./cmd/client ) || {
+( cd "$ROOT_DIR" \
+    && "$GO_BIN" build -o "$SRV_BIN" ./cmd/server \
+    && "$GO_BIN" build -o "$CLI_BIN" ./cmd/client \
+    && "$GO_BIN" build -o "$KEYGEN_BIN" ./cmd/keygen ) || {
     echo "build failed"; exit 1; }
+
+# --- identities ------------------------------------------------------------
+# Generate static keys up front so the client can pin the server's public key
+# and the server can allowlist the client's public key.
+log "generating Noise identities..."
+SRV_KEY="${LOG_DIR}/server.key";  SRV_PUB="$("$KEYGEN_BIN" -out "$SRV_KEY" 2>/dev/null)"
+CLI_KEY="${LOG_DIR}/client.key";  CLI_PUB="$("$KEYGEN_BIN" -out "$CLI_KEY" 2>/dev/null)"
+BAD_KEY="${LOG_DIR}/bad.key";     BAD_PUB="$("$KEYGEN_BIN" -out "$BAD_KEY" 2>/dev/null)"
+OTHER_PUB="$("$KEYGEN_BIN" 2>/dev/null | awk '/public/{print $2}')" # an unrelated key
+if [[ -n "$SRV_PUB" && -n "$CLI_PUB" && -n "$BAD_PUB" ]]; then
+    ok "generated server/client/bad identities via keygen"
+else
+    bad "keygen failed"; exit 1
+fi
 
 # --- topology --------------------------------------------------------------
 log "setting up network namespaces..."
@@ -101,16 +118,18 @@ else
     bad "underlay veth connectivity"; exit 1
 fi
 
-# --- launch server & client (PSK authenticated) ----------------------------
-log "starting VPN server in $NS_S (PSK auth enabled)..."
+# --- launch server & client (Noise authenticated) --------------------------
+log "starting VPN server in $NS_S (Noise; client allowlisted)..."
 ip netns exec "$NS_S" "$SRV_BIN" \
-    -listen "0.0.0.0:${PORT}" -tun-ip "${TUN_S}/24" -peer-ip "$TUN_C" -mtu 1420 -psk "$PSK" \
+    -listen "0.0.0.0:${PORT}" -tun-ip "${TUN_S}/24" -peer-ip "$TUN_C" -mtu 1420 \
+    -key-file "$SRV_KEY" -peers "$CLI_PUB" \
     >"${LOG_DIR}/server.log" 2>&1 &
 sleep 1.5
 
-log "starting VPN client in $NS_C (matching PSK)..."
+log "starting VPN client in $NS_C (pinning server key)..."
 ip netns exec "$NS_C" "$CLI_BIN" \
-    -server "${UNDERLAY_S}:${PORT}" -tun-ip "${TUN_C}/24" -peer-ip "$TUN_S" -mtu 1420 -psk "$PSK" \
+    -server "${UNDERLAY_S}:${PORT}" -tun-ip "${TUN_C}/24" -peer-ip "$TUN_S" -mtu 1420 \
+    -key-file "$CLI_KEY" -server-key "$SRV_PUB" \
     >"${LOG_DIR}/client.log" 2>&1 &
 sleep 2
 
@@ -199,25 +218,40 @@ else
     fi
 fi
 
-# --- negative test: wrong PSK must be rejected -----------------------------
-log "negative auth test: connecting with a WRONG PSK (must be rejected)..."
+# --- negative test 1: unauthorised client identity -------------------------
+log "negative test 1: client identity NOT in the server allowlist..."
 ip netns exec "$NS_BAD" "$CLI_BIN" \
     -server "${UNDERLAY_S2}:${PORT}" -tun-ip "10.0.0.9/24" -peer-ip "$TUN_S" -mtu 1420 \
-    -psk "totally-wrong-key" \
-    >"${LOG_DIR}/badclient.log" 2>&1 &
+    -key-file "$BAD_KEY" -server-key "$SRV_PUB" \
+    >"${LOG_DIR}/badclient1.log" 2>&1 &
 BAD_PID=$!
 sleep 2
-
-if grep -q "Rejected handshake from ${UNDERLAY_B}" "${LOG_DIR}/server.log"; then
-    ok "server rejected wrong-PSK client (${UNDERLAY_B})"
+if grep -q "unauthorised client key" "${LOG_DIR}/server.log"; then
+    ok "server rejected unauthorised client identity"
 else
-    bad "server did NOT reject wrong-PSK client"
+    bad "server did NOT reject unauthorised client"
 fi
-# The wrong-PSK client must never reach the data phase.
-if grep -q "Handshake successful" "${LOG_DIR}/badclient.log"; then
-    bad "wrong-PSK client completed handshake (auth bypass!)"
+if grep -q "Handshake successful" "${LOG_DIR}/badclient1.log"; then
+    bad "unauthorised client completed handshake (authz bypass!)"
 else
-    ok "wrong-PSK client never authenticated"
+    ok "unauthorised client never authenticated"
+fi
+kill "$BAD_PID" 2>/dev/null
+ip netns pids "$NS_BAD" 2>/dev/null | xargs -r kill 2>/dev/null
+sleep 0.5
+
+# --- negative test 2: wrong pinned server key (MITM) -----------------------
+log "negative test 2: client pins the WRONG server key (MITM scenario)..."
+ip netns exec "$NS_BAD" "$CLI_BIN" \
+    -server "${UNDERLAY_S2}:${PORT}" -tun-ip "10.0.0.9/24" -peer-ip "$TUN_S" -mtu 1420 \
+    -key-file "$BAD_KEY" -server-key "$OTHER_PUB" \
+    >"${LOG_DIR}/badclient2.log" 2>&1 &
+BAD_PID=$!
+sleep 3
+if grep -q "Handshake successful" "${LOG_DIR}/badclient2.log"; then
+    bad "client authenticated a server with the wrong key (MITM not prevented!)"
+else
+    ok "client refused to authenticate the server under a wrong pinned key"
 fi
 kill "$BAD_PID" 2>/dev/null
 

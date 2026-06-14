@@ -62,8 +62,36 @@ end-to-end тест в network namespaces (`scripts/integration-test.sh`).
 `TestReplayRejected`/`TestOutOfOrderWithinWindowAccepted`, а e2e-тест проверяет
 успешную аутентификацию по PSK и **отклонение клиента с неверным PSK**.
 
+## Security hardening (раунд 3): Noise + per-IP rate limiting
+
+Заменил симметричный PSK на асимметричную идентификацию по ключам (как WireGuard)
+и сделал rate limiting пер-IP. Формат провода снова обновлён согласованно.
+
+- **Noise Protocol** (`pkg/session`, библиотека `github.com/flynn/noise`):
+  паттерн `Noise_IK_25519_ChaChaPoly_BLAKE2s`. Свою криптографию для handshake не
+  писал — использована зрелая реализация Noise.
+  - У каждой стороны статическая Curve25519-идентичность (`-key-file`, генерится
+    `cmd/keygen`). Клиент **пинит** публичный ключ сервера (`-server-key`) →
+    защита от MITM. Сервер сверяет ключ клиента с **allowlist** (`-peers`) →
+    авторизация по «сертификату»-ключу вместо общего PSK.
+  - **PFS**: эфемерные ключи в каждом handshake.
+  - Транспорт: два ChaCha20-Poly1305 CipherState (по направлению); явный 64-бит
+    counter в каждом кадре служит nonce + входом для прежнего sliding-window
+    анти-replay (`SetNonce` + окно). Это в точности подход WireGuard поверх UDP.
+- **Per-source-IP rate limiting** (`pkg/ratelimit.IPLimiter`): отдельный
+  token-bucket на каждый IP (≈5/с, burst 10, до 4096 IP с вытеснением
+  least-recently-seen) + глобальный backstop (≈100/с, burst 200).
+- Удалён пакет `pkg/crypto` (PSK-handshake, эпохи, AES-GCM SessionCipher) —
+  заменён на `pkg/session`.
+
+Тесты: `pkg/session` (полный handshake, MITM-reject, replay, tamper, out-of-order,
+round-trip идентичностей), `ratelimit` (изоляция источников, вытеснение, гонки).
+E2E (13/13): рабочий туннель, шифрование на проводе, **+2 негативных сценария**
+(неавторизованный клиент; MITM с неверным `-server-key`).
+
 ## Известные ограничения (по дизайну демо — не баги)
 
-- PSK — один общий ключ на всех клиентов; для production нужны сертификаты/Noise.
-- Rate limiting глобальный, без учёта source-IP.
+- Нет периодического rehandshake — одна Noise-сессия на подключение (PFS — между
+  подключениями). Для долгих сессий стоит добавить rekey, как в WireGuard.
+- Allowlist публичных ключей вручную; CA/сертификатов нет.
 - Сервер не настраивает NAT/forwarding автоматически (см. `scripts/setup-vpn-nat.sh`).

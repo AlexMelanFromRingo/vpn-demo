@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,22 +10,24 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/AlexMelanFromRingo/vpn-demo/pkg/crypto"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/ipparse"
+	"github.com/AlexMelanFromRingo/vpn-demo/pkg/session"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/transport"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/tun"
 )
 
 type Client struct {
-	keyPair    *crypto.KeyPair
-	cipher     *crypto.SessionCipher
-	tunDev     *tun.Interface
-	udpTrans   *transport.UDPTransport
-	serverAddr string
-	psk        []byte
+	identity     *session.Identity
+	serverStatic []byte
+	session      *session.Session
+	sessionMu    sync.RWMutex
+	tunDev       *tun.Interface
+	udpTrans     *transport.UDPTransport
+	serverAddr   string
 }
 
 func main() {
@@ -34,24 +35,32 @@ func main() {
 	tunIP := flag.String("tun-ip", "10.0.0.2/24", "TUN interface IP")
 	peerIP := flag.String("peer-ip", "10.0.0.1", "Peer IP for TUN (server)")
 	mtu := flag.Int("mtu", 1420, "MTU size")
-	pskFlag := flag.String("psk", "", "pre-shared key matching the server (or set VPN_PSK env)")
+	keyFile := flag.String("key-file", "client.key", "path to the client's static identity key (created if missing)")
+	serverKey := flag.String("server-key", "", "REQUIRED: server's static public key (base64) to pin")
 	flag.Parse()
-
-	psk := resolvePSK(*pskFlag)
 
 	log.Println("=== Lightweight VPN Client ===")
 	log.Printf("Server: %s", *serverAddr)
 	log.Printf("TUN IP: %s", *tunIP)
-	if len(psk) == 0 {
-		log.Println("WARNING: no PSK set (-psk / VPN_PSK) — connection is unauthenticated")
+
+	if *serverKey == "" {
+		log.Fatalf("-server-key is required (the server prints its static public key at startup)")
+	}
+	serverStatic, err := session.ParsePublicKey(*serverKey)
+	if err != nil {
+		log.Fatalf("Invalid -server-key: %v", err)
 	}
 
-	// Generate client key pair
-	keyPair, err := crypto.GenerateKeyPair()
+	// Load (or create) the client's long-term static identity.
+	identity, created, err := session.LoadOrCreateIdentityFile(*keyFile)
 	if err != nil {
-		log.Fatalf("Failed to generate key pair: %v", err)
+		log.Fatalf("Failed to load identity: %v", err)
 	}
-	log.Printf("Client Public Key: %s", keyPair.PublicKeyToString())
+	if created {
+		log.Printf("Generated new client identity, saved to %s", *keyFile)
+	}
+	log.Printf("Client static public key: %s", identity.PublicKeyBase64())
+	log.Printf("  -> add to the server's allowlist: -peers %s", identity.PublicKeyBase64())
 
 	// Ensure Wintun is available (Windows only, auto-downloads if needed)
 	if err := tun.EnsureWintun(); err != nil {
@@ -83,15 +92,15 @@ func main() {
 	defer udpTrans.Close()
 
 	client := &Client{
-		keyPair:    keyPair,
-		tunDev:     tunDev,
-		udpTrans:   udpTrans,
-		serverAddr: *serverAddr,
-		psk:        psk,
+		identity:     identity,
+		serverStatic: serverStatic,
+		tunDev:       tunDev,
+		udpTrans:     udpTrans,
+		serverAddr:   *serverAddr,
 	}
 
 	// Perform handshake
-	log.Println("Initiating handshake with server...")
+	log.Println("Initiating Noise handshake with server...")
 	if err := client.handshake(); err != nil {
 		log.Fatalf("Handshake failed: %v", err)
 	}
@@ -111,14 +120,30 @@ func main() {
 	log.Println("Shutting down...")
 }
 
+// getSession returns the established session, or nil if the handshake has not
+// completed yet.
+func (c *Client) getSession() *session.Session {
+	c.sessionMu.RLock()
+	defer c.sessionMu.RUnlock()
+	return c.session
+}
+
 func (c *Client) handshake() error {
-	// Send our authenticated public key (PSK-keyed HMAC + timestamp).
-	handshakePacket := transport.NewHandshakePacket(crypto.BuildHandshake(c.psk, c.keyPair.PublicKey, time.Now().Unix()))
-	if err := c.udpTrans.Send(handshakePacket, nil); err != nil {
+	ini, err := session.NewInitiator(c.identity, c.serverStatic)
+	if err != nil {
 		return err
 	}
 
-	// Wait for server response with timeout
+	// Send the first Noise message.
+	msg1, err := ini.WriteMsg1()
+	if err != nil {
+		return err
+	}
+	if err := c.udpTrans.Send(transport.NewHandshakePacket(msg1), nil); err != nil {
+		return err
+	}
+
+	// Wait for the server response with a timeout.
 	c.udpTrans.SetReadDeadline(time.Now().Add(10 * time.Second))
 	defer c.udpTrans.SetReadDeadline(time.Time{})
 
@@ -126,35 +151,21 @@ func (c *Client) handshake() error {
 	if err != nil {
 		return err
 	}
-
 	if packet.Type != transport.PacketTypeHandshake {
 		return fmt.Errorf("unexpected packet type during handshake: got 0x%02x, want handshake (0x%02x)", packet.Type, transport.PacketTypeHandshake)
 	}
 
-	// Authenticate the server's response and recover its public key. With a PSK
-	// set this also defeats a man-in-the-middle swapping the server's key.
-	serverPubKey, err := crypto.OpenHandshake(c.psk, packet.Payload, time.Now().Unix(), crypto.DefaultHandshakeSkewSec)
+	// Completing the handshake authenticates the server: it proves the server
+	// holds the private key for the pinned -server-key, defeating MITM.
+	sess, err := ini.ReadMsg2(packet.Payload)
 	if err != nil {
-		return fmt.Errorf("server handshake authentication failed: %w", err)
+		return fmt.Errorf("server authentication failed (wrong -server-key or unauthorised): %w", err)
 	}
 
-	log.Printf("Server Public Key: %s", base64.StdEncoding.EncodeToString(serverPubKey[:]))
-
-	// Compute shared secret
-	sharedSecret, err := c.keyPair.ComputeSharedSecret(serverPubKey)
-	if err != nil {
-		return err
-	}
-
-	// Create cipher
-	cipher, err := crypto.NewSessionCipher(sharedSecret)
-	if err != nil {
-		return err
-	}
-
-	c.cipher = cipher
-	log.Printf("Shared secret established (epoch: %d)", cipher.GetCurrentEpoch())
-
+	c.sessionMu.Lock()
+	c.session = sess
+	c.sessionMu.Unlock()
+	log.Printf("Authenticated session established with %s", c.serverAddr)
 	return nil
 }
 
@@ -172,8 +183,13 @@ func (c *Client) handleUDP() {
 		}
 
 		if packet.Type == transport.PacketTypeData {
-			// Decrypt packet
-			plaintext, err := c.cipher.Decrypt(packet.Payload)
+			sess := c.getSession()
+			if sess == nil {
+				continue
+			}
+
+			// Decrypt packet (also enforces the anti-replay window).
+			plaintext, err := sess.Decrypt(packet.Payload)
 			if err != nil {
 				log.Printf("Decryption failed: %v", err)
 				continue
@@ -214,7 +230,8 @@ func (c *Client) handleTUN() {
 			continue
 		}
 
-		if c.cipher == nil {
+		sess := c.getSession()
+		if sess == nil {
 			continue
 		}
 
@@ -225,7 +242,7 @@ func (c *Client) handleTUN() {
 		}
 
 		// Encrypt packet
-		encrypted, err := c.cipher.Encrypt(packet)
+		encrypted, err := sess.Encrypt(packet)
 		if err != nil {
 			log.Printf("Encryption failed: %v", err)
 			continue
@@ -241,24 +258,12 @@ func (c *Client) handleTUN() {
 	}
 }
 
-// resolvePSK returns the pre-shared key from the flag, falling back to the
-// VPN_PSK environment variable so secrets need not appear on the command line.
-func resolvePSK(flagVal string) []byte {
-	if flagVal != "" {
-		return []byte(flagVal)
-	}
-	if env := os.Getenv("VPN_PSK"); env != "" {
-		return []byte(env)
-	}
-	return nil
-}
-
 func (c *Client) keepAlive() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if c.cipher == nil {
+		if c.getSession() == nil {
 			continue
 		}
 
