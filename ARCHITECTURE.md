@@ -97,14 +97,25 @@ sessionKey = SHA256(sharedSecret || epoch)
 **Формат зашифрованных данных:**
 ```
 ┌───────────┬──────────┬─────────────┬──────────────┐
-│ Epoch (8) │ Nonce(12)│ Ciphertext  │ Auth Tag(16) │
+│ Epoch (8) │ Seq (8)  │ Ciphertext  │ Auth Tag(16) │
 └───────────┴──────────┴─────────────┴──────────────┘
 ```
 
-- **Epoch**: Временная метка для определения ключа
-- **Nonce**: Случайное значение (должно быть уникальным для каждого сообщения)
+- **Epoch**: Временная метка для определения ключа (`SHA256(secret‖epoch)`)
+- **Seq**: Монотонный sequence number. Служит детерминированным GCM-nonce
+  (гарантирует уникальность nonce под одним ключом, без birthday-bound) и входом
+  для sliding-window анти-replay фильтра на приёме
 - **Ciphertext**: Зашифрованные данные
 - **Auth Tag**: GMAC тег для проверки подлинности
+
+**Аутентифицированный handshake (PSK):**
+```
+┌────────────┬───────────────┬──────────────────────────────────┐
+│ PubKey(32) │ Timestamp (8) │ HMAC-SHA256(psk, pubkey‖ts) (32)  │
+└────────────┴───────────────┴──────────────────────────────────┘
+```
+Проверяется constant-time сравнением; timestamp с допуском ±60 c ограничивает
+replay handshake. Привязка pubkey к MAC закрывает MITM-подмену ключа.
 
 ### 3. Transport Layer (`pkg/transport/`)
 
@@ -320,22 +331,25 @@ Client                           Server
 
 | Угроза | Защита |
 |--------|--------|
-| Man-in-the-Middle | ECDH key exchange + no cert pinning ⚠️ |
+| Man-in-the-Middle | ECDH + PSK-аутентификация handshake (HMAC привязан к pubkey) |
+| Unauthorized clients | PSK обязателен при заданном `-psk`/`VPN_PSK` |
 | Eavesdropping | AES-256-GCM encryption |
 | Packet tampering | GCM authentication tag |
-| Replay attacks | Nonce uniqueness (⚠️ no sequence numbers yet) |
+| Replay attacks | Sequence number + sliding window (RFC 6479) + детерм. nonce |
+| Handshake replay | Timestamp с допуском ±60 c |
 | Traffic analysis | Random padding, random prefix |
 | DPI detection | Obfuscation layer |
-| Key compromise | Key rotation every 5 min |
+| Key compromise | Key rotation every 5 min (PFS) |
+| DoS (handshake flood) | Token-bucket rate limiting; PSK-проверка до ECDH |
 
 ### Текущие ограничения
 
-⚠️ **Это базовая реализация для обучения!**
+⚠️ **Это учебная реализация.** Реализовано: PSK-аутентификация, анти-replay,
+rate limiting. Остаётся для production:
 
-1. **Нет аутентификации клиентов** - любой может подключиться
-2. **Нет защиты от replay** - нет sequence numbers
-3. **Vulnerable to DoS** - нет rate limiting
-4. **No cert validation** - можно сделать MITM при первом подключении
+1. **PSK вместо сертификатов/Noise** — один общий ключ на всех клиентов
+2. **Глобальный** rate limit, без учёта source-IP
+3. **No cert validation** — доверие к серверу строится на знании PSK
 
 ### Улучшения для production
 

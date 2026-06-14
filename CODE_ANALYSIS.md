@@ -41,11 +41,29 @@ end-to-end тест в network namespaces (`scripts/integration-test.sh`).
   **отсутствие открытого payload на проводе** (маркер `cafebabe…` не виден в
   перехвате tcpdump).
 
+## Security hardening (раунд 2)
+
+Реализовано поверх исправлений выше (формат провода обновлён согласованно на
+обоих концах):
+
+- **PSK-аутентификация handshake** (`pkg/crypto/handshake.go`):
+  `pubkey‖timestamp‖HMAC-SHA256(psk, …)`, constant-time проверка. Чужой клиент
+  без PSK не подключится; привязка pubkey к MAC закрывает MITM. Флаг `-psk` /
+  env `VPN_PSK` у сервера и клиента.
+- **Анти-replay** (`pkg/crypto/replay.go`, RFC 6479): в каждый data-пакет добавлен
+  монотонный sequence number, он же — детерминированный GCM-nonce. На приёме —
+  sliding-window (1024): каждый seq принимается один раз, дубликаты/устаревшие
+  отбрасываются (`ErrReplay`). Замечание: ротация ключей по эпохам (TOTP) сама по
+  себе от replay **не** защищает — она лишь меняет ключ.
+- **Rate limiting** (`pkg/ratelimit/`): token-bucket на handshake (≈25/с, burst
+  50); PSK-проверка (дешёвый HMAC) выполняется **до** дорогого ECDH.
+
+Покрыто тестами: `handshake_test.go`, `replay_test.go`, `ratelimit_test.go`,
+`TestReplayRejected`/`TestOutOfOrderWithinWindowAccepted`, а e2e-тест проверяет
+успешную аутентификацию по PSK и **отклонение клиента с неверным PSK**.
+
 ## Известные ограничения (по дизайну демо — не баги)
 
-Остаются осознанными ограничениями учебного проекта (уже отмечены в README/ARCHITECTURE):
-
-- Нет аутентификации клиента (любой может подключиться) — нужен PSK/сертификаты.
-- Нет защиты от replay внутри эпохи (нет sequence numbers / sliding window).
-- Нет rate limiting (DoS на handshake).
+- PSK — один общий ключ на всех клиентов; для production нужны сертификаты/Noise.
+- Rate limiting глобальный, без учёта source-IP.
 - Сервер не настраивает NAT/forwarding автоматически (см. `scripts/setup-vpn-nat.sh`).

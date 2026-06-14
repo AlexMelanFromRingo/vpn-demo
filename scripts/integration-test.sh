@@ -20,6 +20,14 @@ UNDERLAY_C="10.50.0.2"
 PORT="51820"
 TUN_S="10.0.0.1"
 TUN_C="10.0.0.2"
+PSK="s3cr3t-integration-key"
+
+# Second underlay for the negative (wrong-PSK) authentication test.
+NS_BAD="vpn_test_bad"
+VETH_S2="vpn_t_s2"
+VETH_B="vpn_t_b"
+UNDERLAY_S2="10.51.0.1"
+UNDERLAY_B="10.51.0.2"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRV_BIN="${ROOT_DIR}/bin/vpn-server"
@@ -36,10 +44,13 @@ bad()  { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 cleanup() {
     ip netns pids "$NS_S" 2>/dev/null | xargs -r kill 2>/dev/null
     ip netns pids "$NS_C" 2>/dev/null | xargs -r kill 2>/dev/null
+    ip netns pids "$NS_BAD" 2>/dev/null | xargs -r kill 2>/dev/null
     sleep 0.2
     ip netns del "$NS_S" 2>/dev/null
     ip netns del "$NS_C" 2>/dev/null
+    ip netns del "$NS_BAD" 2>/dev/null
     ip link del "$VETH_S" 2>/dev/null
+    ip link del "$VETH_S2" 2>/dev/null
     echo "--- server log (tail) ---"; tail -n 40 "${LOG_DIR}/server.log" 2>/dev/null
     echo "--- client log (tail) ---"; tail -n 40 "${LOG_DIR}/client.log" 2>/dev/null
 }
@@ -63,15 +74,25 @@ log "setting up network namespaces..."
 cleanup 2>/dev/null
 ip netns add "$NS_S"
 ip netns add "$NS_C"
+ip netns add "$NS_BAD"
 ip link add "$VETH_S" type veth peer name "$VETH_C"
 ip link set "$VETH_S" netns "$NS_S"
 ip link set "$VETH_C" netns "$NS_C"
+# second underlay: server <-> wrong-PSK client
+ip link add "$VETH_S2" type veth peer name "$VETH_B"
+ip link set "$VETH_S2" netns "$NS_S"
+ip link set "$VETH_B" netns "$NS_BAD"
 ip netns exec "$NS_S" ip addr add "${UNDERLAY_S}/24" dev "$VETH_S"
 ip netns exec "$NS_C" ip addr add "${UNDERLAY_C}/24" dev "$VETH_C"
+ip netns exec "$NS_S" ip addr add "${UNDERLAY_S2}/24" dev "$VETH_S2"
+ip netns exec "$NS_BAD" ip addr add "${UNDERLAY_B}/24" dev "$VETH_B"
 ip netns exec "$NS_S" ip link set "$VETH_S" up
 ip netns exec "$NS_C" ip link set "$VETH_C" up
+ip netns exec "$NS_S" ip link set "$VETH_S2" up
+ip netns exec "$NS_BAD" ip link set "$VETH_B" up
 ip netns exec "$NS_S" ip link set lo up
 ip netns exec "$NS_C" ip link set lo up
+ip netns exec "$NS_BAD" ip link set lo up
 
 # sanity: underlay connectivity
 if ip netns exec "$NS_C" ping -c1 -W2 "$UNDERLAY_S" >/dev/null 2>&1; then
@@ -80,16 +101,16 @@ else
     bad "underlay veth connectivity"; exit 1
 fi
 
-# --- launch server & client ------------------------------------------------
-log "starting VPN server in $NS_S..."
+# --- launch server & client (PSK authenticated) ----------------------------
+log "starting VPN server in $NS_S (PSK auth enabled)..."
 ip netns exec "$NS_S" "$SRV_BIN" \
-    -listen "0.0.0.0:${PORT}" -tun-ip "${TUN_S}/24" -peer-ip "$TUN_C" -mtu 1420 \
+    -listen "0.0.0.0:${PORT}" -tun-ip "${TUN_S}/24" -peer-ip "$TUN_C" -mtu 1420 -psk "$PSK" \
     >"${LOG_DIR}/server.log" 2>&1 &
 sleep 1.5
 
-log "starting VPN client in $NS_C..."
+log "starting VPN client in $NS_C (matching PSK)..."
 ip netns exec "$NS_C" "$CLI_BIN" \
-    -server "${UNDERLAY_S}:${PORT}" -tun-ip "${TUN_C}/24" -peer-ip "$TUN_S" -mtu 1420 \
+    -server "${UNDERLAY_S}:${PORT}" -tun-ip "${TUN_C}/24" -peer-ip "$TUN_S" -mtu 1420 -psk "$PSK" \
     >"${LOG_DIR}/client.log" 2>&1 &
 sleep 2
 
@@ -177,6 +198,28 @@ else
         bad "underlay packet counter did not increase as expected (+${delta})"
     fi
 fi
+
+# --- negative test: wrong PSK must be rejected -----------------------------
+log "negative auth test: connecting with a WRONG PSK (must be rejected)..."
+ip netns exec "$NS_BAD" "$CLI_BIN" \
+    -server "${UNDERLAY_S2}:${PORT}" -tun-ip "10.0.0.9/24" -peer-ip "$TUN_S" -mtu 1420 \
+    -psk "totally-wrong-key" \
+    >"${LOG_DIR}/badclient.log" 2>&1 &
+BAD_PID=$!
+sleep 2
+
+if grep -q "Rejected handshake from ${UNDERLAY_B}" "${LOG_DIR}/server.log"; then
+    ok "server rejected wrong-PSK client (${UNDERLAY_B})"
+else
+    bad "server did NOT reject wrong-PSK client"
+fi
+# The wrong-PSK client must never reach the data phase.
+if grep -q "Handshake successful" "${LOG_DIR}/badclient.log"; then
+    bad "wrong-PSK client completed handshake (auth bypass!)"
+else
+    ok "wrong-PSK client never authenticated"
+fi
+kill "$BAD_PID" 2>/dev/null
 
 # --- summary ---------------------------------------------------------------
 echo

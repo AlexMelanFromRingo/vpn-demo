@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,6 +26,7 @@ type Client struct {
 	tunDev     *tun.Interface
 	udpTrans   *transport.UDPTransport
 	serverAddr string
+	psk        []byte
 }
 
 func main() {
@@ -32,11 +34,17 @@ func main() {
 	tunIP := flag.String("tun-ip", "10.0.0.2/24", "TUN interface IP")
 	peerIP := flag.String("peer-ip", "10.0.0.1", "Peer IP for TUN (server)")
 	mtu := flag.Int("mtu", 1420, "MTU size")
+	pskFlag := flag.String("psk", "", "pre-shared key matching the server (or set VPN_PSK env)")
 	flag.Parse()
+
+	psk := resolvePSK(*pskFlag)
 
 	log.Println("=== Lightweight VPN Client ===")
 	log.Printf("Server: %s", *serverAddr)
 	log.Printf("TUN IP: %s", *tunIP)
+	if len(psk) == 0 {
+		log.Println("WARNING: no PSK set (-psk / VPN_PSK) — connection is unauthenticated")
+	}
 
 	// Generate client key pair
 	keyPair, err := crypto.GenerateKeyPair()
@@ -79,6 +87,7 @@ func main() {
 		tunDev:     tunDev,
 		udpTrans:   udpTrans,
 		serverAddr: *serverAddr,
+		psk:        psk,
 	}
 
 	// Perform handshake
@@ -103,8 +112,8 @@ func main() {
 }
 
 func (c *Client) handshake() error {
-	// Send our public key
-	handshakePacket := transport.NewHandshakePacket([]byte(c.keyPair.PublicKeyToString()))
+	// Send our authenticated public key (PSK-keyed HMAC + timestamp).
+	handshakePacket := transport.NewHandshakePacket(crypto.BuildHandshake(c.psk, c.keyPair.PublicKey, time.Now().Unix()))
 	if err := c.udpTrans.Send(handshakePacket, nil); err != nil {
 		return err
 	}
@@ -122,13 +131,14 @@ func (c *Client) handshake() error {
 		return fmt.Errorf("unexpected packet type during handshake: got 0x%02x, want handshake (0x%02x)", packet.Type, transport.PacketTypeHandshake)
 	}
 
-	// Parse server public key
-	serverPubKey, err := crypto.PublicKeyFromString(string(packet.Payload))
+	// Authenticate the server's response and recover its public key. With a PSK
+	// set this also defeats a man-in-the-middle swapping the server's key.
+	serverPubKey, err := crypto.OpenHandshake(c.psk, packet.Payload, time.Now().Unix(), crypto.DefaultHandshakeSkewSec)
 	if err != nil {
-		return err
+		return fmt.Errorf("server handshake authentication failed: %w", err)
 	}
 
-	log.Printf("Server Public Key: %s", string(packet.Payload))
+	log.Printf("Server Public Key: %s", base64.StdEncoding.EncodeToString(serverPubKey[:]))
 
 	// Compute shared secret
 	sharedSecret, err := c.keyPair.ComputeSharedSecret(serverPubKey)
@@ -229,6 +239,18 @@ func (c *Client) handleTUN() {
 			log.Printf("✓ Sent ICMP packet to server")
 		}
 	}
+}
+
+// resolvePSK returns the pre-shared key from the flag, falling back to the
+// VPN_PSK environment variable so secrets need not appear on the command line.
+func resolvePSK(flagVal string) []byte {
+	if flagVal != "" {
+		return []byte(flagVal)
+	}
+	if env := os.Getenv("VPN_PSK"); env != "" {
+		return []byte(env)
+	}
+	return nil
 }
 
 func (c *Client) keepAlive() {

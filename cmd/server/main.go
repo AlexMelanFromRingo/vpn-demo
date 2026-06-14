@@ -15,6 +15,7 @@ import (
 
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/crypto"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/ipparse"
+	"github.com/AlexMelanFromRingo/vpn-demo/pkg/ratelimit"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/transport"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/tun"
 )
@@ -27,10 +28,13 @@ type Client struct {
 
 type Server struct {
 	keyPair   *crypto.KeyPair
+	psk       []byte
 	tunDev    *tun.Interface
 	udpTrans  *transport.UDPTransport
 	clients   map[string]*Client
 	clientsMu sync.RWMutex
+
+	handshakeLimiter *ratelimit.TokenBucket
 }
 
 func main() {
@@ -38,11 +42,19 @@ func main() {
 	tunIP := flag.String("tun-ip", "10.0.0.1/24", "TUN interface IP")
 	peerIP := flag.String("peer-ip", "10.0.0.2", "Peer IP for TUN")
 	mtu := flag.Int("mtu", 1420, "MTU size")
+	pskFlag := flag.String("psk", "", "pre-shared key for client authentication (or set VPN_PSK env)")
 	flag.Parse()
+
+	psk := resolvePSK(*pskFlag)
 
 	log.Println("=== Lightweight VPN Server ===")
 	log.Printf("Listen: %s", *listenAddr)
 	log.Printf("TUN IP: %s", *tunIP)
+	if len(psk) == 0 {
+		log.Println("WARNING: no PSK set (-psk / VPN_PSK) — client authentication is DISABLED")
+	} else {
+		log.Println("Client authentication: ENABLED (PSK)")
+	}
 
 	// Generate server key pair
 	keyPair, err := crypto.GenerateKeyPair()
@@ -83,9 +95,13 @@ func main() {
 
 	server := &Server{
 		keyPair:  keyPair,
+		psk:      psk,
 		tunDev:   tunDev,
 		udpTrans: udpTrans,
 		clients:  make(map[string]*Client),
+		// Bound handshake processing to mitigate DoS from unauthenticated floods:
+		// ~25 handshakes/sec sustained, bursts up to 50.
+		handshakeLimiter: ratelimit.NewTokenBucket(25, 50),
 	}
 
 	// Handle graceful shutdown
@@ -128,12 +144,20 @@ func (s *Server) handleUDP() {
 }
 
 func (s *Server) handleHandshake(packet *transport.Packet, addr *net.UDPAddr) {
+	// Rate-limit handshake processing to bound CPU under floods.
+	if !s.handshakeLimiter.Allow() {
+		log.Printf("Handshake from %s dropped (rate limited)", addr)
+		return
+	}
+
 	log.Printf("Handshake from %s", addr)
 
-	// Parse client public key
-	clientPubKey, err := crypto.PublicKeyFromString(string(packet.Payload))
+	// Authenticate the handshake with the PSK and recover the client's public
+	// key. This is a cheap HMAC check done BEFORE the (more expensive) ECDH, so
+	// unauthenticated peers are rejected without doing scalar multiplication.
+	clientPubKey, err := crypto.OpenHandshake(s.psk, packet.Payload, time.Now().Unix(), crypto.DefaultHandshakeSkewSec)
 	if err != nil {
-		log.Printf("Invalid public key from %s: %v", addr, err)
+		log.Printf("Rejected handshake from %s: %v", addr, err)
 		return
 	}
 
@@ -163,11 +187,23 @@ func (s *Server) handleHandshake(packet *transport.Packet, addr *net.UDPAddr) {
 
 	log.Printf("Client registered: %s (epoch: %d)", addr, cipher.GetCurrentEpoch())
 
-	// Send our public key back
-	response := transport.NewHandshakePacket([]byte(s.keyPair.PublicKeyToString()))
+	// Send our authenticated public key back.
+	response := transport.NewHandshakePacket(crypto.BuildHandshake(s.psk, s.keyPair.PublicKey, time.Now().Unix()))
 	if err := s.udpTrans.Send(response, addr); err != nil {
 		log.Printf("Failed to send handshake response: %v", err)
 	}
+}
+
+// resolvePSK returns the pre-shared key from the flag, falling back to the
+// VPN_PSK environment variable so secrets need not appear on the command line.
+func resolvePSK(flagVal string) []byte {
+	if flagVal != "" {
+		return []byte(flagVal)
+	}
+	if env := os.Getenv("VPN_PSK"); env != "" {
+		return []byte(env)
+	}
+	return nil
 }
 
 func (s *Server) handleData(packet *transport.Packet, addr *net.UDPAddr) {

@@ -56,8 +56,27 @@ epoch = unix_timestamp / 300  // Новый ключ каждые 5 минут
 
 Encrypted data содержит:
 ```
-[epoch(8)] [nonce(12)] [ciphertext] [auth_tag(16)]
+[epoch(8)] [seq(8)] [ciphertext] [auth_tag(16)]
 ```
+
+- **epoch** — выбирает ключ сессии (`SHA256(secret‖epoch)`).
+- **seq** — монотонный sequence number. Одновременно служит детерминированным
+  GCM-nonce (исключает риск повторного nonce у случайных значений) и входом для
+  sliding-window анти-replay фильтра на приёме (RFC 6479).
+
+### Аутентификация (PSK) и защита от replay
+
+- **Handshake** аутентифицируется HMAC-SHA256 на pre-shared key:
+  `pubkey(32) ‖ timestamp(8) ‖ HMAC(psk, pubkey‖timestamp)(32)`. Без знания PSK
+  подключиться нельзя, а привязка pubkey к MAC защищает ECDH от MITM. Timestamp
+  (допуск ±60 c) ограничивает replay самого handshake.
+- **Data-пакеты** защищены sequence number + скользящим окном (1024): каждый seq
+  принимается ровно один раз; дубликаты и устаревшие пакеты отбрасываются.
+- **Rate limiting**: token-bucket на обработку handshake (≈25/с, burst 50);
+  проверка PSK выполняется до дорогого ECDH.
+
+> ⚠️ Ротация ключей по эпохам (TOTP-подобная) сама по себе **не** защищает от
+> replay — она лишь меняет ключ. Защиту даёт именно sequence number + окно.
 
 ## Требования
 
@@ -102,7 +121,9 @@ make all-platforms
 
 ```bash
 # Требуется root для создания TUN интерфейса
-sudo ./bin/vpn-server -listen 0.0.0.0:51820 -tun-ip 10.0.0.1/24 -peer-ip 10.0.0.2
+sudo ./bin/vpn-server -listen 0.0.0.0:51820 -tun-ip 10.0.0.1/24 -peer-ip 10.0.0.2 -psk "общий-секрет"
+# PSK можно передать и через переменную окружения (не светится в списке процессов):
+# sudo VPN_PSK="общий-секрет" ./bin/vpn-server ...
 ```
 
 Параметры:
@@ -110,16 +131,18 @@ sudo ./bin/vpn-server -listen 0.0.0.0:51820 -tun-ip 10.0.0.1/24 -peer-ip 10.0.0.
 - `-tun-ip` - IP адрес TUN интерфейса на сервере (по умолчанию `10.0.0.1/24`)
 - `-peer-ip` - IP адрес клиента (по умолчанию `10.0.0.2`)
 - `-mtu` - MTU для TUN интерфейса (по умолчанию `1420`)
+- `-psk` - pre-shared key для аутентификации клиентов (или env `VPN_PSK`).
+  Если не задан — аутентификация выключена (выводится предупреждение).
 
 ### На клиенте (Windows/Linux)
 
 ```bash
 # Linux
-sudo ./bin/vpn-client -server 172.26.171.205:51820 -tun-ip 10.0.0.2/24 -peer-ip 10.0.0.1
+sudo ./bin/vpn-client -server 172.26.171.205:51820 -tun-ip 10.0.0.2/24 -peer-ip 10.0.0.1 -psk "общий-секрет"
 
 # Windows (запустить от имени администратора)
 # При первом запуске автоматически скачает wintun.dll и установит драйвер!
-vpn-client.exe -server 172.26.171.205:51820 -tun-ip 10.0.0.2/24 -peer-ip 10.0.0.1
+vpn-client.exe -server 172.26.171.205:51820 -tun-ip 10.0.0.2/24 -peer-ip 10.0.0.1 -psk "общий-секрет"
 ```
 
 **Windows особенности:**
@@ -175,13 +198,14 @@ ping 10.0.0.1
 - ✅ Автоматическая ротация ключей
 - ✅ DPI obfuscation - случайные данные
 - ✅ Perfect Forward Secrecy через ротацию ключей
+- ✅ **Аутентификация клиентов** по pre-shared key (HMAC-SHA256) + анти-MITM
+- ✅ **Replay attack protection** (sequence numbers + sliding window, RFC 6479)
+- ✅ **DoS protection** (token-bucket rate limiting на handshake)
 
 ### Возможные улучшения
-- [ ] Аутентификация клиентов (pre-shared key или сертификаты)
-- [ ] Replay attack protection (sequence numbers)
-- [ ] DoS protection (rate limiting)
+- [ ] Сертификаты / Noise Protocol handshake вместо PSK
+- [ ] Per-source-IP rate limiting (сейчас глобальный лимит)
 - [ ] Более сложная обфускация (имитация HTTPS/DNS)
-- [ ] WireGuard-подобный протокол handshake
 
 ## Устранение проблем
 
@@ -211,9 +235,10 @@ sudo ufw allow 51820/udp
 │   ├── server/          # VPN сервер
 │   └── client/          # VPN клиент
 ├── pkg/
-│   ├── crypto/          # Криптография (Curve25519, AES-GCM, ротация ключей) + тесты
+│   ├── crypto/          # Curve25519, AES-GCM, ротация ключей, PSK-handshake, анти-replay + тесты
 │   ├── transport/       # UDP транспорт с обфускацией + тесты/фаззинг
 │   ├── ipparse/         # Разбор IPv4 для логов (общий для server/client) + тесты
+│   ├── ratelimit/       # Token-bucket лимитер (анти-DoS на handshake) + тесты
 │   └── tun/             # TUN интерфейс (Linux/Windows)
 ├── scripts/
 │   └── integration-test.sh  # End-to-end тест через network namespaces

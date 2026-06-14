@@ -3,6 +3,7 @@ package crypto
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"sync"
 	"testing"
 )
@@ -167,8 +168,49 @@ func TestAEADCacheBounded(t *testing.T) {
 	}
 }
 
+// TestReplayRejected verifies that decrypting the same ciphertext twice is
+// rejected by the anti-replay window.
+func TestReplayRejected(t *testing.T) {
+	client, server := newCipherPair(t)
+
+	ct, err := client.Encrypt([]byte("fresh packet"))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if _, err := server.Decrypt(ct); err != nil {
+		t.Fatalf("first decrypt should succeed: %v", err)
+	}
+	_, err = server.Decrypt(ct)
+	if !errors.Is(err, ErrReplay) {
+		t.Fatalf("replay not rejected, got err=%v", err)
+	}
+}
+
+// TestOutOfOrderWithinWindowAccepted verifies modest reordering still decrypts.
+func TestOutOfOrderWithinWindowAccepted(t *testing.T) {
+	client, server := newCipherPair(t)
+
+	var cts [][]byte
+	for i := 0; i < 100; i++ {
+		ct, _ := client.Encrypt([]byte{byte(i)})
+		cts = append(cts, ct)
+	}
+	// Deliver in reverse order; all are unique and within the window.
+	for i := len(cts) - 1; i >= 0; i-- {
+		if _, err := server.Decrypt(cts[i]); err != nil {
+			t.Fatalf("reordered packet %d rejected: %v", i, err)
+		}
+	}
+	// Re-delivering any of them must now be rejected as a replay.
+	if _, err := server.Decrypt(cts[50]); !errors.Is(err, ErrReplay) {
+		t.Fatalf("expected replay rejection, got %v", err)
+	}
+}
+
 // TestConcurrentEncryptDecrypt exercises the cipher from many goroutines to
-// surface data races under `go test -race`.
+// surface data races under `go test -race`. Total packets are kept below the
+// replay window size so that arbitrary reordering never triggers a (correct)
+// stale-packet rejection.
 func TestConcurrentEncryptDecrypt(t *testing.T) {
 	client, server := newCipherPair(t)
 	var wg sync.WaitGroup
@@ -177,7 +219,7 @@ func TestConcurrentEncryptDecrypt(t *testing.T) {
 		go func(g int) {
 			defer wg.Done()
 			msg := bytes.Repeat([]byte{byte(g)}, 100)
-			for i := 0; i < 200; i++ {
+			for i := 0; i < 50; i++ { // 16 * 50 = 800 < replayWindowBits (1024)
 				ct, err := client.Encrypt(msg)
 				if err != nil {
 					t.Errorf("encrypt: %v", err)
@@ -213,13 +255,18 @@ func BenchmarkEncrypt(b *testing.B) {
 
 func BenchmarkDecrypt(b *testing.B) {
 	var secret [32]byte
-	c, _ := NewSessionCipher(secret)
+	sender, _ := NewSessionCipher(secret)
+	receiver, _ := NewSessionCipher(secret)
 	plain := bytes.Repeat([]byte{0xCD}, 1400)
-	ct, _ := c.Encrypt(plain)
 	b.SetBytes(1400)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := c.Decrypt(ct); err != nil {
+		// Each packet has a fresh sequence number, so the replay filter accepts
+		// it. The encryption is excluded from the measured time.
+		b.StopTimer()
+		ct, _ := sender.Encrypt(plain)
+		b.StartTimer()
+		if _, err := receiver.Decrypt(ct); err != nil {
 			b.Fatal(err)
 		}
 	}
