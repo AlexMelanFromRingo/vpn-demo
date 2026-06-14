@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"log"
-	"os"
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wintun"
@@ -51,10 +50,6 @@ func (w *wintunDevice) Close() error {
 	w.adapter.Close()
 	// DON'T delete - prevents duplicates!
 
-	return nil
-}
-
-func (w *wintunDevice) File() *os.File {
 	return nil
 }
 

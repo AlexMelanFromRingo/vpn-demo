@@ -1,4 +1,4 @@
-.PHONY: all build server client windows-client clean deps test
+.PHONY: all build server client windows-client clean deps test test-race vet integration-test
 
 all: build
 
@@ -29,7 +29,19 @@ clean:
 	go clean
 
 test:
-	go test -v ./...
+	go test ./...
+
+test-race:
+	go test -race ./...
+
+vet:
+	go vet ./...
+	gofmt -l .
+
+# End-to-end test: runs server+client in network namespaces and verifies that
+# traffic flows through the encrypted tunnel. Requires root.
+integration-test: build
+	sudo PATH=$$PATH bash scripts/integration-test.sh
 
 run-server: server
 	@echo "Starting server (requires root)..."

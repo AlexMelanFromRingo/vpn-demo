@@ -7,7 +7,6 @@ type device interface {
 	Read([]byte) (int, error)
 	Write([]byte) (int, error)
 	Close() error
-	File() *os.File // For Linux only
 }
 
 // tunDevice is a simple file-based TUN device (Linux)
@@ -25,8 +24,4 @@ func (t *tunDevice) Write(buf []byte) (int, error) {
 
 func (t *tunDevice) Close() error {
 	return t.file.Close()
-}
-
-func (t *tunDevice) File() *os.File {
-	return t.file
 }

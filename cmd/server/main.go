@@ -1,8 +1,9 @@
 package main
 
 import (
+	"errors"
 	"flag"
-	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -13,58 +14,23 @@ import (
 	"time"
 
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/crypto"
+	"github.com/AlexMelanFromRingo/vpn-demo/pkg/ipparse"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/transport"
 	"github.com/AlexMelanFromRingo/vpn-demo/pkg/tun"
 )
 
-// Helper function to parse IP packet for debugging
-func parseIPPacket(packet []byte) string {
-	if len(packet) < 20 {
-		return "Invalid IP packet (too short)"
-	}
-
-	version := packet[0] >> 4
-	if version != 4 {
-		return "Not IPv4"
-	}
-
-	protocol := packet[9]
-	srcIP := net.IP(packet[12:16])
-	dstIP := net.IP(packet[16:20])
-
-	var protoName string
-	switch protocol {
-	case 1:
-		protoName = "ICMP"
-		if len(packet) >= 24 {
-			icmpType := packet[20]
-			icmpCode := packet[21]
-			return fmt.Sprintf("ICMP type=%d code=%d from %s to %s", icmpType, icmpCode, srcIP, dstIP)
-		}
-		return fmt.Sprintf("ICMP from %s to %s", srcIP, dstIP)
-	case 6:
-		protoName = "TCP"
-	case 17:
-		protoName = "UDP"
-	default:
-		protoName = fmt.Sprintf("Protocol-%d", protocol)
-	}
-
-	return fmt.Sprintf("%s from %s to %s", protoName, srcIP, dstIP)
-}
-
 type Client struct {
-	addr   *net.UDPAddr
-	cipher *crypto.SessionCipher
+	addr     *net.UDPAddr
+	cipher   *crypto.SessionCipher
 	lastSeen time.Time
 }
 
 type Server struct {
-	keyPair    *crypto.KeyPair
-	tunDev     *tun.Interface
-	udpTrans   *transport.UDPTransport
-	clients    map[string]*Client
-	clientsMu  sync.RWMutex
+	keyPair   *crypto.KeyPair
+	tunDev    *tun.Interface
+	udpTrans  *transport.UDPTransport
+	clients   map[string]*Client
+	clientsMu sync.RWMutex
 }
 
 func main() {
@@ -140,7 +106,13 @@ func (s *Server) handleUDP() {
 	for {
 		packet, addr, err := s.udpTrans.Receive()
 		if err != nil {
+			// The socket was closed (graceful shutdown) — stop the loop instead
+			// of spinning on a permanent error.
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			log.Printf("UDP receive error: %v", err)
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 
@@ -241,18 +213,23 @@ func (s *Server) handleTUN() {
 	for {
 		packet, err := s.tunDev.ReadPacket()
 		if err != nil {
+			// Device closed on shutdown — stop cleanly.
+			if errors.Is(err, os.ErrClosed) || errors.Is(err, io.EOF) {
+				return
+			}
 			// Don't spam logs for normal read timeouts/empty reads
 			errStr := err.Error()
 			if !strings.Contains(errStr, "EOF") &&
-			   !strings.Contains(errStr, "No more data is available") &&
-			   !strings.Contains(errStr, "timeout") {
+				!strings.Contains(errStr, "No more data is available") &&
+				!strings.Contains(errStr, "timeout") {
 				log.Printf("TUN read error: %v", err)
 			}
+			time.Sleep(5 * time.Millisecond)
 			continue
 		}
 
 		// Debug: Log packet info (especially ICMP)
-		packetInfo := parseIPPacket(packet)
+		packetInfo := ipparse.Describe(packet)
 		if strings.Contains(packetInfo, "ICMP") {
 			log.Printf("TUN → Client: %s (len=%d)", packetInfo, len(packet))
 		}

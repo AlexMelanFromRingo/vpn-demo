@@ -36,20 +36,20 @@ func (p *Packet) Marshal() ([]byte, error) {
 		return nil, fmt.Errorf("payload too large: %d", payloadLen)
 	}
 
-	// Random prefix to make packets look different (DPI obfuscation)
-	randomPrefix := make([]byte, 8)
-	rand.Read(randomPrefix)
+	// Random prefix + padding size + padding are drawn from a single random read
+	// so we only touch the CSPRNG once per packet and can check the error.
+	randomBytes := make([]byte, 8+1+MaxPaddingSize)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return nil, fmt.Errorf("failed to read random bytes: %w", err)
+	}
+	randomPrefix := randomBytes[0:8]
 
-	// Random padding size
+	// Random padding size in [MinPaddingSize, MaxPaddingSize].
 	paddingSize := MinPaddingSize
 	if MaxPaddingSize > MinPaddingSize {
-		var randByte [1]byte
-		rand.Read(randByte[:])
-		paddingSize = int(randByte[0]) % (MaxPaddingSize - MinPaddingSize + 1)
+		paddingSize = MinPaddingSize + int(randomBytes[8])%(MaxPaddingSize-MinPaddingSize+1)
 	}
-
-	padding := make([]byte, paddingSize)
-	rand.Read(padding)
+	padding := randomBytes[9 : 9+paddingSize]
 
 	// Total size: random_prefix(8) + type(1) + len(2) + payload + padding
 	totalSize := 8 + 1 + 2 + payloadLen + paddingSize

@@ -38,11 +38,13 @@ Lightweight VPN - это современный VPN с упором на без�
 - Пакеты, записанные в TUN, попадают в сетевой стек ОС
 
 **Файлы:**
-- `interface.go` - общий интерфейс
-- `interface_linux.go` - Linux-специфичная инициализация
-- `interface_windows.go` - Windows-специфичная инициализация
-- `setup_linux.go` - настройка IP/routes для Linux
-- `setup_windows.go` - настройка IP/routes для Windows
+- `interface.go` - общий интерфейс (Read/Write/Close, ReadPacket/WritePacket)
+- `device.go` - внутренний интерфейс `device` + файловая реализация для Linux
+- `tun_linux.go` - создание TUN через `/dev/net/tun` (ioctl TUNSETIFF)
+- `tun_windows.go` - создание адаптера через Wintun
+- `wintun_windows.go` / `wintun_linux.go` - авто-загрузка `wintun.dll` (Windows) / no-op (Linux)
+- `setup_linux.go` - настройка IP/routes для Linux (`ip addr`/`ip link`)
+- `setup_windows.go` - настройка IP/routes для Windows (`netsh`)
 
 **Пример потока:**
 ```

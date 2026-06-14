@@ -211,11 +211,37 @@ sudo ufw allow 51820/udp
 │   ├── server/          # VPN сервер
 │   └── client/          # VPN клиент
 ├── pkg/
-│   ├── crypto/          # Криптография (Curve25519, AES-GCM, ротация ключей)
-│   ├── transport/       # UDP транспорт с обфускацией
+│   ├── crypto/          # Криптография (Curve25519, AES-GCM, ротация ключей) + тесты
+│   ├── transport/       # UDP транспорт с обфускацией + тесты/фаззинг
+│   ├── ipparse/         # Разбор IPv4 для логов (общий для server/client) + тесты
 │   └── tun/             # TUN интерфейс (Linux/Windows)
-├── Makefile            # Сборка
+├── scripts/
+│   └── integration-test.sh  # End-to-end тест через network namespaces
+├── Makefile            # Сборка и тесты
 └── README.md           # Документация
+```
+
+## Тестирование
+
+### Юнит-тесты (с детектором гонок)
+```bash
+make test          # go test ./...
+make test-race     # go test -race ./...
+```
+
+Покрывают: согласование ECDH-секрета, round-trip и аутентификацию AES-GCM,
+обнаружение подделки, отказ при неверном ключе, детерминированный вывод ключа по
+эпохе, ограниченность кэша ключей, сериализацию пакетов и фаззинг `Unmarshal`,
+разбор IPv4/ICMP (в т.ч. с IP-опциями).
+
+### End-to-end интеграционный тест
+Поднимает сервер и клиент в двух изолированных network namespaces, соединённых
+veth, и проверяет реальное прохождение ICMP через зашифрованный туннель в обе
+стороны, а также (при наличии `tcpdump`) отсутствие открытого payload на проводе:
+```bash
+make integration-test       # требует root (sudo)
+# или напрямую:
+sudo bash scripts/integration-test.sh
 ```
 
 ## Производительность
