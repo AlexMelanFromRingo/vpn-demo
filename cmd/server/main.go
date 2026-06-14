@@ -23,7 +23,7 @@ import (
 
 type Client struct {
 	addr     *net.UDPAddr
-	session  *session.Session
+	channel  *session.Channel
 	lastSeen time.Time
 }
 
@@ -200,17 +200,25 @@ func (s *Server) handleHandshake(packet *transport.Packet, addr *net.UDPAddr) {
 		return
 	}
 
-	// Store client
+	// Store the client, or rotate its keys if this is a periodic rehandshake
+	// from an already-connected client. Rotating keeps the previous session
+	// briefly valid so in-flight packets are not dropped during the switch.
 	clientKey := addr.String()
 	s.clientsMu.Lock()
-	s.clients[clientKey] = &Client{
-		addr:     addr,
-		session:  sess,
-		lastSeen: time.Now(),
+	if existing, ok := s.clients[clientKey]; ok {
+		existing.channel.Rotate(sess)
+		existing.lastSeen = time.Now()
+		s.clientsMu.Unlock()
+		log.Printf("Rehandshake from %s (key %s)", addr, clientKeyB64)
+	} else {
+		s.clients[clientKey] = &Client{
+			addr:     addr,
+			channel:  session.NewChannel(sess, session.DefaultRekeyGrace),
+			lastSeen: time.Now(),
+		}
+		s.clientsMu.Unlock()
+		log.Printf("Client registered: %s (key %s)", addr, clientKeyB64)
 	}
-	s.clientsMu.Unlock()
-
-	log.Printf("Client registered: %s (key %s)", addr, clientKeyB64)
 
 	// Send the Noise response message.
 	response := transport.NewHandshakePacket(msg2)
@@ -231,8 +239,9 @@ func (s *Server) handleData(packet *transport.Packet, addr *net.UDPAddr) {
 		return
 	}
 
-	// Decrypt packet (also enforces the anti-replay window).
-	plaintext, err := client.session.Decrypt(packet.Payload)
+	// Decrypt packet (also enforces the anti-replay window). The Channel falls
+	// back to the previous session during a rekey grace window.
+	plaintext, err := client.channel.Decrypt(packet.Payload)
 	if err != nil {
 		log.Printf("Decryption failed from %s: %v", addr, err)
 		return
@@ -298,7 +307,7 @@ func (s *Server) handleTUN() {
 
 		for _, client := range clients {
 			// Encrypt packet
-			encrypted, err := client.session.Encrypt(packet)
+			encrypted, err := client.channel.Encrypt(packet)
 			if err != nil {
 				log.Printf("Encryption failed: %v", err)
 				continue

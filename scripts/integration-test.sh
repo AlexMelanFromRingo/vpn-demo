@@ -126,10 +126,10 @@ ip netns exec "$NS_S" "$SRV_BIN" \
     >"${LOG_DIR}/server.log" 2>&1 &
 sleep 1.5
 
-log "starting VPN client in $NS_C (pinning server key)..."
+log "starting VPN client in $NS_C (pinning server key; rekey every 3s)..."
 ip netns exec "$NS_C" "$CLI_BIN" \
     -server "${UNDERLAY_S}:${PORT}" -tun-ip "${TUN_C}/24" -peer-ip "$TUN_S" -mtu 1420 \
-    -key-file "$CLI_KEY" -server-key "$SRV_PUB" \
+    -key-file "$CLI_KEY" -server-key "$SRV_PUB" -rekey 3s \
     >"${LOG_DIR}/client.log" 2>&1 &
 sleep 2
 
@@ -216,6 +216,27 @@ else
     else
         bad "underlay packet counter did not increase as expected (+${delta})"
     fi
+fi
+
+# --- rehandshake: keys must rotate without breaking the tunnel -------------
+log "verifying periodic rehandshake (rekey 3s) over a sustained ping..."
+# Ping continuously for ~9s, spanning multiple 3s rekey intervals.
+ip netns exec "$NS_C" ping -c9 -i1 -W2 "$TUN_S" >"${LOG_DIR}/ping_rekey.log" 2>&1
+loss=$(grep -o '[0-9]*% packet loss' "${LOG_DIR}/ping_rekey.log" | grep -o '^[0-9]*' || echo 100)
+rekeys_srv=$(grep -c "Rehandshake from" "${LOG_DIR}/server.log" 2>/dev/null || echo 0)
+rekeys_cli=$(grep -c "Rehandshake complete" "${LOG_DIR}/client.log" 2>/dev/null || echo 0)
+
+if [[ "$rekeys_srv" -ge 2 && "$rekeys_cli" -ge 2 ]]; then
+    ok "session keys rotated (server: ${rekeys_srv}, client: ${rekeys_cli} rehandshakes)"
+else
+    bad "rehandshake did not occur (server: ${rekeys_srv}, client: ${rekeys_cli})"
+fi
+# The tunnel must keep working across rekeys (allow at most 1 lost packet at a switch).
+if [[ "${loss:-100}" -le 12 ]]; then
+    ok "tunnel survived rekeys (${loss}% packet loss across ${rekeys_cli}+ rotations)"
+else
+    bad "tunnel dropped traffic across rekeys (${loss}% loss)"
+    cat "${LOG_DIR}/ping_rekey.log"
 fi
 
 # --- negative test 1: unauthorised client identity -------------------------

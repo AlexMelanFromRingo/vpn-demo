@@ -98,6 +98,16 @@ VPN читает пакет через tunDev.ReadPacket()
 собственное обрамление с явным счётчиком и анти-replay (т.к. UDP переупорядочивает
 и теряет пакеты, прямые transport-сообщения Noise неприменимы).
 
+#### 2.3 Периодический rehandshake (`channel.go`)
+
+Клиент (инициатор) раз в `-rekey` повторяет handshake; обе стороны переключают
+сессию на свежие эфемерные ключи. Чтобы не терять пакеты «в полёте» в момент
+переключения, `Channel` хранит **текущую** и **предыдущую** сессии: новый трафик
+шифруется текущей, а при неуспехе расшифровки текущей — пробуется предыдущая в
+пределах **grace-окна** (~30 c). Genuine replay на текущей сессии при этом не
+ретраится на предыдущую. На сервере handshake от уже подключённого адреса
+вызывает `Channel.Rotate` вместо создания нового клиента.
+
 ### 3. Transport Layer (`pkg/transport/`)
 
 #### 3.1 Packet Format (`packet.go`)
@@ -319,17 +329,17 @@ Client                           Server
 | Replay attacks | Counter + sliding window (RFC 6479) |
 | Traffic analysis | Random padding, random prefix |
 | DPI detection | Obfuscation layer |
-| Key compromise | Perfect Forward Secrecy (эфемерные ключи на сессию) |
+| Key compromise | PFS + периодический rehandshake (ротация эфемерных ключей) |
 | DoS (handshake flood) | Per-source-IP rate limiting + глобальный backstop |
 
 ### Текущие ограничения
 
 ⚠️ **Это учебная реализация.** Реализовано: Noise-аутентификация по ключам,
-анти-replay, per-IP rate limiting. Остаётся для production:
+анти-replay, per-IP rate limiting, периодический rehandshake. Остаётся для
+production:
 
-1. **Нет периодического rehandshake** — одна сессия на подключение
-2. **Allowlist ключей вручную** — без CA/сертификатов
-3. **Глобальный TUN/маршрутизация** — NAT настраивается отдельным скриптом
+1. **Allowlist ключей вручную** — без CA/сертификатов
+2. **Глобальный TUN/маршрутизация** — NAT настраивается отдельным скриптом
 
 ### Уже реализовано (бывшие TODO)
 
@@ -339,8 +349,8 @@ Client                           Server
 - ✅ Rate limiting — per-source-IP + глобальный backstop (`pkg/ratelimit`).
 
 ### Что ещё можно добавить
-- Периодический rehandshake (rekey) для долгоживущих сессий, как в WireGuard.
 - CA/сертификаты вместо ручного allowlist публичных ключей.
+- Rekey также по числу переданных пакетов/байт (сейчас только по времени).
 
 ## Производительность
 

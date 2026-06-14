@@ -23,11 +23,16 @@ import (
 type Client struct {
 	identity     *session.Identity
 	serverStatic []byte
-	session      *session.Session
-	sessionMu    sync.RWMutex
+	channel      *session.Channel // set once by the initial handshake, then thread-safe
 	tunDev       *tun.Interface
 	udpTrans     *transport.UDPTransport
 	serverAddr   string
+	rekey        time.Duration
+
+	// pending holds an in-progress periodic rehandshake awaiting the server's
+	// response (msg2), which arrives asynchronously on the handleUDP goroutine.
+	pendingMu sync.Mutex
+	pending   *session.Initiator
 }
 
 func main() {
@@ -37,6 +42,7 @@ func main() {
 	mtu := flag.Int("mtu", 1420, "MTU size")
 	keyFile := flag.String("key-file", "client.key", "path to the client's static identity key (created if missing)")
 	serverKey := flag.String("server-key", "", "REQUIRED: server's static public key (base64) to pin")
+	rekey := flag.Duration("rekey", 120*time.Second, "periodic rehandshake interval for forward secrecy (0 disables)")
 	flag.Parse()
 
 	log.Println("=== Lightweight VPN Client ===")
@@ -97,9 +103,11 @@ func main() {
 		tunDev:       tunDev,
 		udpTrans:     udpTrans,
 		serverAddr:   *serverAddr,
+		rekey:        *rekey,
 	}
 
-	// Perform handshake
+	// Perform the initial handshake synchronously so the channel exists before
+	// the data goroutines start.
 	log.Println("Initiating Noise handshake with server...")
 	if err := client.handshake(); err != nil {
 		log.Fatalf("Handshake failed: %v", err)
@@ -114,18 +122,14 @@ func main() {
 	go client.handleUDP()
 	go client.handleTUN()
 	go client.keepAlive()
+	if client.rekey > 0 {
+		go client.rekeyLoop()
+		log.Printf("Periodic rehandshake every %s", client.rekey)
+	}
 
 	log.Println("Client started successfully!")
 	<-sigChan
 	log.Println("Shutting down...")
-}
-
-// getSession returns the established session, or nil if the handshake has not
-// completed yet.
-func (c *Client) getSession() *session.Session {
-	c.sessionMu.RLock()
-	defer c.sessionMu.RUnlock()
-	return c.session
 }
 
 func (c *Client) handshake() error {
@@ -162,11 +166,65 @@ func (c *Client) handshake() error {
 		return fmt.Errorf("server authentication failed (wrong -server-key or unauthorised): %w", err)
 	}
 
-	c.sessionMu.Lock()
-	c.session = sess
-	c.sessionMu.Unlock()
+	c.channel = session.NewChannel(sess, session.DefaultRekeyGrace)
 	log.Printf("Authenticated session established with %s", c.serverAddr)
 	return nil
+}
+
+// rekeyLoop periodically starts a fresh handshake so long-lived sessions keep
+// rotating to new ephemeral keys (forward secrecy). The response is completed
+// asynchronously by handleUDP.
+func (c *Client) rekeyLoop() {
+	ticker := time.NewTicker(c.rekey)
+	defer ticker.Stop()
+	for range ticker.C {
+		if err := c.startRehandshake(); err != nil {
+			log.Printf("Rehandshake start failed: %v", err)
+		}
+	}
+}
+
+// startRehandshake sends a new msg1 and records the pending initiator.
+func (c *Client) startRehandshake() error {
+	ini, err := session.NewInitiator(c.identity, c.serverStatic)
+	if err != nil {
+		return err
+	}
+	msg1, err := ini.WriteMsg1()
+	if err != nil {
+		return err
+	}
+
+	c.pendingMu.Lock()
+	c.pending = ini
+	c.pendingMu.Unlock()
+
+	return c.udpTrans.Send(transport.NewHandshakePacket(msg1), nil)
+}
+
+// completeRehandshake feeds the server's response to the pending initiator and,
+// on success, rotates the channel to the freshly negotiated session.
+func (c *Client) completeRehandshake(msg2 []byte) {
+	c.pendingMu.Lock()
+	ini := c.pending
+	c.pendingMu.Unlock()
+	if ini == nil {
+		return // unsolicited handshake packet
+	}
+
+	sess, err := ini.ReadMsg2(msg2)
+	if err != nil {
+		// Leave pending in place; a correct retransmit may still complete it.
+		log.Printf("Rehandshake response rejected: %v", err)
+		return
+	}
+
+	c.pendingMu.Lock()
+	c.pending = nil
+	c.pendingMu.Unlock()
+
+	c.channel.Rotate(sess)
+	log.Printf("Rehandshake complete — rotated to new session keys")
 }
 
 func (c *Client) handleUDP() {
@@ -182,14 +240,18 @@ func (c *Client) handleUDP() {
 			continue
 		}
 
-		if packet.Type == transport.PacketTypeData {
-			sess := c.getSession()
-			if sess == nil {
+		switch packet.Type {
+		case transport.PacketTypeHandshake:
+			// Response to a periodic rehandshake.
+			c.completeRehandshake(packet.Payload)
+
+		case transport.PacketTypeData:
+			if c.channel == nil {
 				continue
 			}
 
 			// Decrypt packet (also enforces the anti-replay window).
-			plaintext, err := sess.Decrypt(packet.Payload)
+			plaintext, err := c.channel.Decrypt(packet.Payload)
 			if err != nil {
 				log.Printf("Decryption failed: %v", err)
 				continue
@@ -230,8 +292,7 @@ func (c *Client) handleTUN() {
 			continue
 		}
 
-		sess := c.getSession()
-		if sess == nil {
+		if c.channel == nil {
 			continue
 		}
 
@@ -242,7 +303,7 @@ func (c *Client) handleTUN() {
 		}
 
 		// Encrypt packet
-		encrypted, err := sess.Encrypt(packet)
+		encrypted, err := c.channel.Encrypt(packet)
 		if err != nil {
 			log.Printf("Encryption failed: %v", err)
 			continue
@@ -263,7 +324,7 @@ func (c *Client) keepAlive() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if c.getSession() == nil {
+		if c.channel == nil {
 			continue
 		}
 
